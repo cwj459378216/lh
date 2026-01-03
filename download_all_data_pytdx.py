@@ -10,7 +10,6 @@ from tqdm import tqdm
 
 # 也支持读取本地通达信日线文件（vipdoc/sh|sz/lday/*.day）
 # python download_all_data_pytdx.py --tdx-lday "D:\tdx\vipdoc\sh\lday" --out ".\通达信\data\pytdx\daily_raw"
-# python download_all_data_pytdx.py --tdx-lday "D:\tdx\vipdoc" --cap-csv ".\output\caps.csv" --out ".\通达信\data\pytdx\daily_raw"
 try:
     from pytdx.reader import TdxDailyBarReader
 except Exception:
@@ -191,62 +190,18 @@ def _clear_output_dir(path: str):
         pass
 
 
-def _load_cap_csv(path: str) -> pd.DataFrame:
-    """读取流通市值映射 CSV，支持列(code/symbol, cap/float_cap)。
-    统一输出：code(6位)、cap_billion(亿元)。"""
-    try:
-        df = pd.read_csv(path, dtype=str)
-    except Exception:
-        return pd.DataFrame()
-    cols = [c.lower() for c in df.columns]
-    df.columns = cols
-    # 解析代码
-    if 'code' in df.columns:
-        codes = df['code'].str[-6:].str.zfill(6)
-    elif 'symbol' in df.columns:
-        codes = df['symbol'].str[:6]
-    else:
-        return pd.DataFrame()
-    # 解析市值列
-    cap_col = None
-    for c in ['cap', 'float_cap', 'market_cap', 'float_market_cap']:
-        if c in df.columns:
-            cap_col = c
-            break
-    if cap_col is None:
-        return pd.DataFrame()
-    cap_raw = pd.to_numeric(df[cap_col], errors='coerce')
-    avg = pd.to_numeric(cap_raw, errors='coerce').dropna().mean()
-    if pd.isna(avg):
-        return pd.DataFrame()
-    # 大于1000则认为单位为元，转换为亿元
-    cap_billion = cap_raw / 1e8 if avg > 1000 else cap_raw
-    out = pd.DataFrame({'code': codes, 'cap_billion': pd.to_numeric(cap_billion, errors='coerce')})
-    return out.dropna(subset=['cap_billion']).reset_index(drop=True)
-
-
 def main():
     parser = argparse.ArgumentParser(description='仅使用本地通达信 vipdoc 日线文件导出最近一年数据（A股10%涨停上限，原始价量）')
     parser.add_argument('--tdx-lday', type=str, required=True, help='通达信 vipdoc 目录，或其下的 sh/lday、sz/lday 路径，例如 D:\\tdx\\vipdoc 或 D:\\tdx\\vipdoc\\sh\\lday')
     parser.add_argument('--out', default=os.path.join(os.path.dirname(__file__), 'data', 'pytdx', 'daily_raw'), help='输出目录')
     parser.add_argument('--overwrite', action='store_true', help='已存在是否覆盖')
     parser.add_argument('--limit', type=int, default=None, help='仅导出前 N 个标的')
-    # 新增：市值映射 CSV（将市值加入到每个导出的行中，列名为 cap_billion）
-    parser.add_argument('--cap-csv', type=str, default=None, help='流通市值映射 CSV（含 code/symbol 与 cap/float_cap，单位元或亿元自动识别）')
     # 移除名称关键字(ST)过滤相关参数
     args = parser.parse_args()
 
     ensure_dir(args.out)
     # 下载前清理历史 CSV
     _clear_output_dir(args.out)
-
-    # 读取市值映射
-    cap_map = None
-    if args.cap_csv:
-        cap_map = _load_cap_csv(args.cap_csv)
-        if cap_map is None or cap_map.empty:
-            tqdm.write('警告：未能读取有效的市值映射，导出时将不包含市值列。')
-            cap_map = None
 
     end = datetime.today().date()
     start = end - relativedelta(months=12)
@@ -284,12 +239,6 @@ def main():
             failed.append(symbol)
             pbar.update(1)
             continue
-        # 合并市值（将同一标的的市值写入每一行的 cap_billion 列）
-        if cap_map is not None:
-            row = cap_map[cap_map['code'] == code]
-            if not row.empty:
-                cap_bil = float(row['cap_billion'].iloc[0])
-                df['cap_billion'] = cap_bil
         df.to_csv(out_fp, index=False, encoding='utf-8-sig')
         saved += 1
         try:

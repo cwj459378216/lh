@@ -1,10 +1,45 @@
 import os
-import argparse
+# import argparse  # 不再使用命令行参数
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
 import pandas as pd
 from tqdm import tqdm
+import requests
+import json
+from dataclasses import dataclass
+
+# 统一参数配置（集中管理默认值）
+@dataclass
+class Config:
+    # 路径与输出（硬编码）：数据源目录与结果文件路径
+    data_dir: str = os.path.join(os.path.dirname(__file__), '通达信', 'data', 'pytdx', 'daily_raw')
+    default_out: str = os.path.join(os.path.dirname(__file__), 'output', 'selection_local.csv')
+    date_subdir: bool = True  # 是否按当天日期(YYYYMMDD)创建子文件夹保存输出
+    # 市值过滤（单位：元）：总市值区间与是否跳过过滤
+    mktcap_min: float = 8e9   # 市值下限，默认80亿
+    mktcap_max: float = 15e9  # 市值上限，默认150亿
+    skip_mktcap: bool = True # 跳过市值/估值过滤开关
+    # 选股核心参数（全部硬编码）：窗口、振幅、接近低点、涨停统计与阈值、放量参数、A股10%前缀过滤
+    months: int = 3                   # 近几个月作为振幅窗口
+    range_lower: float = 0.10         # 振幅下限（比例）
+    range_upper: float = 0.20         # 振幅上限（比例）
+    near_low_tol: float = 0.03        # 接近近低容差（比例）
+    limitup_months: int = 12          # 涨停统计窗口（月）
+    limitup_threshold: float = 0.098  # 涨停阈值（收盘涨幅近似≥9.8%）
+    min_limitup_count: int = 2        # 正价涨停次数最少要求（近一年）
+    vol_days: int = 5                 # 放量考察天数
+    vol_factor: float = 2.0           # 放量倍数阈值（当日成交量≥前一日X倍）
+    only_10pct_a: bool = True         # 是否仅保留10%涨停上限A股常见前缀
+    # 估值过滤（PE-TTM）：估值上下限，None 表示不限制
+    pe_min: float | None = None       # PE(TTM)下限，例如10.0
+    pe_max: float | None = None       # PE(TTM)上限，例如40.0
+    # 形态附加条件：最近N天全部收红，或最近N天内存在单日涨幅≥阈值
+    last_n_days_red_n: int = 3        # 最近收红天数要求的窗口（默认3天）
+    up_pct_days_n: int = 3            # 检查单日涨幅的最近天数窗口（默认3天）
+    up_pct_threshold: float = 0.03     # 单日涨幅阈值（比例，默认3%）
+
+CFG = Config()
 
 # 数据目录格式：
 
@@ -97,40 +132,27 @@ def has_volume_spike_last_n_days(df: pd.DataFrame, n: int = 5, factor: float = 2
     return bool((ratios.iloc[1:] >= factor).any())
 
 
-def load_cap_csv(path: str) -> pd.DataFrame:
-    """读取流通市值映射 CSV，支持列(code/symbol, cap)，cap单位可为亿元或元。
-    规范输出列：code(6位)、cap_billion(以亿元计)。"""
-    try:
-        df = pd.read_csv(path, dtype=str)
-    except Exception:
-        return pd.DataFrame()
-    cols = [c.lower() for c in df.columns]
-    df.columns = cols
-    # 提取 code
-    if 'code' in df.columns:
-        out = df[['code']].copy()
-        out['code'] = out['code'].str[-6:].str.zfill(6)
-    elif 'symbol' in df.columns:
-        out = pd.DataFrame({'code': df['symbol'].str[:6]})
-    else:
-        return pd.DataFrame()
-    # 提取 cap
-    if 'cap' in df.columns:
-        cap_raw = pd.to_numeric(df['cap'], errors='coerce')
-    elif 'float_cap' in df.columns:
-        cap_raw = pd.to_numeric(df['float_cap'], errors='coerce')
-    else:
-        return pd.DataFrame()
-    # 自动识别单位：若平均值>1000，则可能为“元”，转换为“亿元”。
-    avg = pd.to_numeric(cap_raw, errors='coerce').dropna().mean()
-    if pd.isna(avg):
-        return pd.DataFrame()
-    if avg and avg > 1000:  # 以元为单位，转亿元
-        cap_billion = cap_raw / 1e8
-    else:  # 已是亿元
-        cap_billion = cap_raw
-    out['cap_billion'] = pd.to_numeric(cap_billion, errors='coerce')
-    return out.dropna(subset=['cap_billion']).reset_index(drop=True)
+def _last_n_days_red(df: pd.DataFrame, n: int = CFG.last_n_days_red_n) -> bool:
+    """最近 n 天全部收红（收盘价 > 开盘价）。"""
+    if df is None or df.empty:
+        return False
+    sub = df.tail(n)
+    if len(sub) < n:
+        return False
+    return bool((sub['close'] > sub['open']).all())
+
+
+def _has_single_day_up_pct(df: pd.DataFrame, n: int = CFG.up_pct_days_n, threshold: float = CFG.up_pct_threshold) -> bool:
+    """最近 n 天内存在单日涨幅 ≥ threshold（按收盘相对前一日收盘）。"""
+    if df is None or df.empty:
+        return False
+    sub = df.tail(n + 1).copy()
+    if len(sub) < 2:
+        return False
+    pre_close = sub['close'].shift(1)
+    pct = (sub['close'] - pre_close) / pre_close
+    pct = pct.iloc[1:]  # 排除第一天无前收
+    return bool((pct >= threshold - 1e-4).any())
 
 
 def scan_dir(data_dir: str,
@@ -142,10 +164,7 @@ def scan_dir(data_dir: str,
              limitup_threshold: float,
              volume_spike_days: int,
              volume_spike_factor: float,
-             only_10pct_a: bool,
-             cap_map: pd.DataFrame | None,
-             cap_min_billion: float,
-             cap_max_billion: float) -> pd.DataFrame:
+             only_10pct_a: bool) -> pd.DataFrame:
     end = datetime.today().date()
     start_3m = end - relativedelta(months=months_lookback)
     start_1y = end - relativedelta(months=limitup_lookback_months)
@@ -174,17 +193,6 @@ def scan_dir(data_dir: str,
             pbar.update(1)
             continue
 
-        # 市值过滤（可选）
-        if cap_map is not None and not cap_map.empty:
-            row = cap_map[cap_map['code'] == code]
-            if row.empty:
-                pbar.update(1)
-                continue
-            cap_bil = float(row['cap_billion'].iloc[0])
-            if not (cap_min_billion <= cap_bil <= cap_max_billion):
-                pbar.update(1)
-                continue
-        
         df = load_csv(fp)
         if df.empty or len(df) < 10:
             pbar.update(1)
@@ -202,14 +210,27 @@ def scan_dir(data_dir: str,
             pbar.update(1)
             continue
 
+        # 计算今年区间内位置（按近一年窗口 bars_all）
+        pos_pct = None
+        if not bars_all.empty:
+            high_1y = float(bars_all['high'].max())
+            low_1y = float(bars_all['low'].min())
+            if high_1y > low_1y and low_1y > 0:
+                pos_pct = (last_close - low_1y) / (high_1y - low_1y)
+                # 夹在 0~1 范围
+                pos_pct = max(0.0, min(1.0, pos_pct))
+
         limitup_cnt = count_limit_up_days(bars_all, limitup_threshold)
         vol_spike = has_volume_spike_last_n_days(bars_all, volume_spike_days, volume_spike_factor)
+        # 新增条件：最近N天收红，或者最近N天内存在单日涨幅≥阈值（统一参数）
+        extra_cond = _last_n_days_red(bars_all, CFG.last_n_days_red_n) or _has_single_day_up_pct(bars_all, CFG.up_pct_days_n, CFG.up_pct_threshold)
 
         if (
             range_lower - 1e-9 <= rng <= range_upper + 1e-9
             and near_low_enough(last_close, low, near_low_tol)
             and limitup_cnt > 5
             and vol_spike
+            and extra_cond
         ):
             results.append({
                 'symbol': stem,
@@ -221,10 +242,17 @@ def scan_dir(data_dir: str,
                 'range_pct': round(rng * 100, 2),
                 'limit_up_days_1y': int(limitup_cnt),
                 'vol_spike_5d': bool(vol_spike),
+                'pos_in_1y': (round(pos_pct * 100, 2) if isinstance(pos_pct, float) else None),
+                'last3_red': _last_n_days_red(bars_all, CFG.last_n_days_red_n),
+                'last3_has_up3pct': _has_single_day_up_pct(bars_all, CFG.up_pct_days_n, CFG.up_pct_threshold),
             })
             found += 1
             try:
-                tqdm.write(f"入选: {stem} | 高:{round(high,3)} 低:{round(low,3)} 现:{round(last_close,3)} 振幅:{round(rng*100,2)}% 涨停:{limitup_cnt} 放量:{'是' if vol_spike else '否'}")
+                tqdm.write(
+                    f"入选: {stem} | 高:{round(high,3)} 低:{round(low,3)} 现:{round(last_close,3)} 振幅:{round(rng*100,2)}% "
+                    f"涨停:{limitup_cnt} 放量:{'是' if vol_spike else '否'} 位置(1年):{(round(pos_pct*100,2) if isinstance(pos_pct,float) else 'N/A')}% "
+                    f"近3天收红:{'是' if _last_n_days_red(bars_all,3) else '否'} 单日≥3%:{'是' if _has_single_day_up_pct(bars_all,3,0.03) else '否'}"
+                )
             except Exception:
                 pass
         pbar.set_postfix(found=found, code=stem)
@@ -234,64 +262,138 @@ def scan_dir(data_dir: str,
     return pd.DataFrame(results)
 
 
+def _fetch_market_cap_eastmoney(code: str, market: str, timeout: float = 5.0) -> float | None:
+    """通过东方财富接口获取总市值(元)。返回 float 或 None。
+    市场编码：SH->1，SZ->0
+    字段 f20: 总市值(元)
+    """
+    try:
+        secid = ('1' if market.upper() == 'SH' else '0') + f'.{code}'
+        url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f20'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        }
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        data = j.get('data') or {}
+        val = data.get('f20')
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _fetch_pe_ttm_eastmoney(code: str, market: str, timeout: float = 5.0) -> float | None:
+    """通过东方财富接口获取 PE(TTM)。字段 f9。返回 float 或 None。"""
+    try:
+        secid = ('1' if market.upper() == 'SH' else '0') + f'.{code}'
+        url = f'https://push2.eastmoney.com/api/qt/stock/get?secid={secid}&fields=f9'
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        }
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        data = j.get('data') or {}
+        val = data.get('f9')
+        if val is None:
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _filter_by_market_cap_and_valuation(rows: list[dict], mc_min: float, mc_max: float, pe_min: float | None, pe_max: float | None) -> list[dict]:
+    """按总市值与估值过滤。"""
+    out = []
+    pbar = tqdm(total=len(rows), desc='市值/估值过滤', dynamic_ncols=True)
+    for r in rows:
+        code = r.get('code', '')
+        market = r.get('market', '')
+        mc = _fetch_market_cap_eastmoney(code, market)
+        pe = _fetch_pe_ttm_eastmoney(code, market)
+        r['market_cap'] = mc
+        r['pe_ttm'] = pe
+        ok_mc = (mc is not None and mc_min - 1e-6 <= mc <= mc_max + 1e-6)
+        ok_pe = True
+        if pe_min is not None:
+            ok_pe = ok_pe and (pe is not None and pe >= pe_min - 1e-9)
+        if pe_max is not None:
+            ok_pe = ok_pe and (pe is not None and pe <= pe_max + 1e-9)
+        if ok_mc and ok_pe:
+            out.append(r)
+        pbar.set_postfix(code=f"{code}.{market}", mc=mc, pe=pe)
+        pbar.update(1)
+    pbar.close()
+    return out
+
+
 def main():
-    parser = argparse.ArgumentParser(description='本地 CSV（pytdx 导出）选股：参考 select_stocks.py 逻辑')
-    parser.add_argument('--data-dir', type=str, required=True, help='CSV 数据目录（包含 *.csv，如 000001.SZ.csv）')
-    parser.add_argument('--out', type=str, default=os.path.join(os.path.dirname(__file__), 'output', 'selection_local.csv'))
-    # 在输出目录下按日期创建子文件夹
-    parser.add_argument('--date-subdir', action='store_true', default=True, help='在输出目录下按当天日期(YYYYMMDD)创建子文件夹并保存文件，默认开启')
-    # 新增市值过滤参数（单位：亿元）
-    parser.add_argument('--cap-csv', type=str, default=None, help='流通市值映射 CSV（含 code/symbol 与 cap 或 float_cap 列，cap单位为亿元或元自动识别）')
-    parser.add_argument('--cap-min', type=float, default=80.0, help='市值下限（亿元），默认80')
-    parser.add_argument('--cap-max', type=float, default=120.0, help='市值上限（亿元），默认120')
-    parser.add_argument('--months', type=int, default=3, help='近几个月作为振幅窗口，默认3')
-    parser.add_argument('--range-lower', type=float, default=0.10, help='振幅下限（比例），默认0.10')
-    parser.add_argument('--range-upper', type=float, default=0.20, help='振幅上限（比例），默认0.20')
-    parser.add_argument('--near-low-tol', type=float, default=0.03, help='接近近低容差（比例），默认0.03')
-    parser.add_argument('--limitup-months', type=int, default=12, help='涨停统计窗口（月），默认12')
-    parser.add_argument('--limitup-threshold', type=float, default=0.098, help='涨停阈值，默认0.098')
-    parser.add_argument('--vol-days', type=int, default=5, help='放量考察天数，默认5')
-    parser.add_argument('--vol-factor', type=float, default=2.0, help='放量倍数阈值，默认2.0')
-    parser.add_argument('--only-10pct-a', action='store_true', default=True, help='仅 A 股 10% 涨停上限常见前缀（默认开启）')
-    parser.add_argument('--no-only-10pct-a', dest='only_10pct_a', action='store_false', help='关闭仅10% A股过滤')
-    args = parser.parse_args()
+    # 使用硬编码的配置
+    data_dir = CFG.data_dir
+    out_path = CFG.default_out
+
+    date_subdir = CFG.date_subdir
+    mktcap_min = CFG.mktcap_min
+    mktcap_max = CFG.mktcap_max
+    skip_mktcap = CFG.skip_mktcap
+    months = CFG.months
+    range_lower = CFG.range_lower
+    range_upper = CFG.range_upper
+    near_low_tol = CFG.near_low_tol
+    limitup_months = CFG.limitup_months
+    limitup_threshold = CFG.limitup_threshold
+    min_limitup_count = CFG.min_limitup_count
+    vol_days = CFG.vol_days
+    vol_factor = CFG.vol_factor
+    only_10pct_a = CFG.only_10pct_a
+    pe_min = CFG.pe_min
+    pe_max = CFG.pe_max
 
     # 处理按日期子目录
-    out_path = args.out
-    if args.date_subdir:
+    if date_subdir:
         date_str = datetime.today().strftime('%Y%m%d')
         out_dir = os.path.dirname(out_path) if out_path.lower().endswith('.csv') else out_path
         out_dir = os.path.join(out_dir, date_str)
-        base_name = os.path.basename(out_path) if out_path.lower().endswith('.csv') else 'selection_local.csv'
+        base_name = os.path.basename(out_path) if out_path.lower().endswith('.csv') else os.path.basename(CFG.default_out)
         out_path = os.path.join(out_dir, base_name)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
-    # 读取市值映射
-    cap_map = None
-    if args.cap_csv:
-        cap_map = load_cap_csv(args.cap_csv)
-        if cap_map is None or cap_map.empty:
-            tqdm.write('警告：未能读取有效的市值映射，跳过市值过滤。')
-            cap_map = None
-
+    # 扫描并筛选
     df = scan_dir(
-        data_dir=args.data_dir,
-        months_lookback=args.months,
-        range_lower=args.range_lower,
-        range_upper=args.range_upper,
-        near_low_tol=args.near_low_tol,
-        limitup_lookback_months=args.limitup_months,
-        limitup_threshold=args.limitup_threshold,
-        volume_spike_days=args.vol_days,
-        volume_spike_factor=args.vol_factor,
-        only_10pct_a=args.only_10pct_a,
-        cap_map=cap_map,
-        cap_min_billion=args.cap_min,
-        cap_max_billion=args.cap_max,
+        data_dir=data_dir,
+        months_lookback=months,
+        range_lower=range_lower,
+        range_upper=range_upper,
+        near_low_tol=near_low_tol,
+        limitup_lookback_months=limitup_months,
+        limitup_threshold=limitup_threshold,
+        volume_spike_days=vol_days,
+        volume_spike_factor=vol_factor,
+        only_10pct_a=only_10pct_a,
     )
 
     if df.empty:
         print('无符合条件的标的')
+        return
+
+    # 市值/估值过滤（使用硬编码参数）
+    if not skip_mktcap:
+        rows = df.to_dict(orient='records')
+        rows = _filter_by_market_cap_and_valuation(rows, mktcap_min, mktcap_max, pe_min, pe_max)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            print('市值/估值过滤后无标的（检查区间是否合理）')
+            return
+
+    # 使用可配置的正价涨停次数要求（硬编码）
+    df = df[df['limit_up_days_1y'] >= int(min_limitup_count)].copy()
+    if df.empty:
+        print('正价涨停次数过滤后无标的')
         return
 
     df = df.sort_values('range_pct').reset_index(drop=True)
