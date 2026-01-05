@@ -27,11 +27,11 @@ class BacktestConfig:
     start_date: str = '20250901'
     end_date: str = '20260103'
     # 回测交易参数
-    initial_capital: float = 100000.0           # 初始资金
+    initial_capital: float = 37000.0          # 初始资金
     buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_ratio: float = 0.5                      # 按百分比买入时使用的资金比例（相对当前可用资金）
-    buy_fixed_amount: float = 10000.0           # 固定金额买入时，每次使用的金额
-    stop_loss_drawdown: float = 0.03            # 回调止损（相对持仓峰值，3%）
+    buy_fixed_amount: float = 3000.0           # 固定金额买入时，每次使用的金额
+    stop_loss_drawdown: float = 0.03            # 收盘价回撤止损：相对“最高收盘价”回撤 3%（从买入后第一天收盘价开始）
     enable_three_days_down_exit: bool = False    # 是否启用“连续三天下跌卖出”规则
 
 CFG = BacktestConfig()
@@ -190,10 +190,18 @@ def main():
             close = _get_close(sym_df, d)
             if close is None:
                 continue
-            # 更新峰值
-            pos['peak_price'] = max(pos['peak_price'], close)
-            # 回撤比例
-            drawdown = (pos['peak_price'] - close) / pos['peak_price'] if pos['peak_price'] > 0 else 0.0
+
+            # 收盘价最高点回撤止损：从“买入后第一天的收盘价”开始
+            # - 买入当天(成交日)不初始化 peak_close
+            # - 遇到首个有效收盘价（通常是成交日当天的 close）时，初始化 peak_close
+            if 'peak_close' not in pos or pos['peak_close'] is None:
+                pos['peak_close'] = close
+                # peak_close 刚初始化当天，不触发止损判断（相当于从下一次更新开始才比较）
+                continue
+
+            pos['peak_close'] = max(float(pos['peak_close']), close)
+            peak_close = float(pos['peak_close']) if pos['peak_close'] else 0.0
+            drawdown = (peak_close - close) / peak_close if peak_close > 0 else 0.0
 
             # 连续三天下跌卖出条件（可配置开关）
             three_days_down = False
@@ -209,7 +217,6 @@ def main():
                     reason = 'STOP_LOSS' if drawdown >= cfg.stop_loss_drawdown and not three_days_down else (
                         'THREE_DAYS_DOWN' if three_days_down and drawdown < cfg.stop_loss_drawdown else 'STOP_LOSS_AND_THREE_DAYS_DOWN')
                 else:
-                    # 未开启连续三天下跌规则时，仅记录回撤止损
                     reason = 'STOP_LOSS'
                 trade_log.append({
                     'date': d.strftime('%Y-%m-%d'),
@@ -239,10 +246,9 @@ def main():
                 # 根据买入模式计算本次使用资金
                 if cfg.buy_mode == 'ratio':
                     buy_cash = cash * cfg.buy_ratio
-                else:  # 默认使用固定金额模式
+                else:
                     buy_cash = cfg.buy_fixed_amount
 
-                # 不超过当前可用现金
                 buy_cash = min(buy_cash, cash)
                 if buy_cash <= 0:
                     continue
@@ -256,9 +262,9 @@ def main():
                 positions[sym] = {
                     'shares': shares,
                     'entry_price': open_price,
-                    'peak_price': open_price,
+                    'buy_date': buy_date,   # 成交日（下一交易日）
+                    'peak_close': None,     # 不用成本价占位，等待“买入后第一天的收盘价”初始化
                 }
-                # 交易记录日期使用实际成交日（下一交易日）
                 trade_log.append({
                     'date': buy_date.strftime('%Y-%m-%d'),
                     'symbol': sym,
@@ -274,8 +280,8 @@ def main():
             sym_df = price_map.get(sym)
             close = _get_close(sym_df, d)
             if close is None:
-                # 若无当日价格则按上次可用峰值估值
-                close = pos['peak_price']
+                # 若无当日价格，则优先用已初始化的 peak_close 兜底，否则用成本价
+                close = float(pos.get('peak_close') or pos['entry_price'])
             equity += pos['shares'] * close
         equity_curve.append({'date': d.strftime('%Y-%m-%d'), 'equity': round(equity, 2), 'cash': round(cash, 2), 'positions': len(positions)})
 
