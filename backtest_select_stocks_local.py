@@ -8,6 +8,9 @@ from dateutil.relativedelta import relativedelta
 # 使用主脚本中的配置与方法，确保一致性
 import select_stocks_local as sel
 
+# 止损/卖出规则抽取为独立模块
+from stop_loss_rules import StopLossConfig, evaluate_exit_signal
+
 @dataclass
 class BacktestConfig:
     data_dir: str = sel.CFG.data_dir
@@ -25,12 +28,18 @@ class BacktestConfig:
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
     start_date: str = '20250901'
-    end_date: str = '20260103'
+    end_date: str = '20260106'
     # 回测交易参数
-    initial_capital: float = 37000.0          # 初始资金
+    initial_capital: float = 100000.0          # 初始资金
     buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_ratio: float = 0.5                      # 按百分比买入时使用的资金比例（相对当前可用资金）
     buy_fixed_amount: float = 4000.0           # 固定金额买入时，每次使用的金额
+
+    # 卖出成交价模式：
+    # - 'close': 当天收盘价卖出
+    # - 'next_open': 下一交易日开盘价卖出（原逻辑）
+    sell_price_mode: str = 'close'
+
     stop_loss_drawdown: float = 0.03            # 收盘价回撤止损：相对“最高收盘价”回撤 3%（从买入后第一天收盘价开始）
     enable_three_days_down_exit: bool = False    # 是否启用“连续三天下跌卖出”规则
 
@@ -38,6 +47,11 @@ class BacktestConfig:
     enable_early_underperform_exit: bool = True
     early_exit_hold_days: int = 7
     early_exit_min_return: float = 0.03  # 3%
+
+    # 新增：回测结束时，未卖出持仓是否用“最后一日收盘价”进行统计性平仓
+    # - True: 若无法按 sell_price_mode 获取成交价，则退化为用最后收盘价（或 peak_close/成本价兜底）
+    # - False: 若无法成交则不做平仓记录，期末权益也不把这些仓位折算为现金
+    close_open_positions_at_end: bool = True
 
 CFG = BacktestConfig()
 
@@ -113,24 +127,23 @@ def _get_next_open(symbol_df: pd.DataFrame, date: pd.Timestamp) -> tuple[pd.Time
     return pd.to_datetime(row['trade_date']), val
 
 
-def _is_last_n_days_all_down(symbol_df: pd.DataFrame, date: pd.Timestamp, n: int = 3) -> bool:
-    """判断给定日期及其前面共 n-1 个交易日，收盘价是否连续下跌（严格单调下降）。
+def _get_sell_price(cfg: BacktestConfig, symbol_df: pd.DataFrame, signal_date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
+    """根据配置决定卖出成交价与成交日。
 
-    要求 symbol_df 中已经包含 date 这一行；如果数据不足 n 天或缺少某天价格，则返回 False。
+    - cfg.sell_price_mode == 'close': 使用 signal_date 当天收盘价成交
+    - cfg.sell_price_mode == 'next_open': 使用 signal_date 的下一交易日开盘价成交
+
+    返回 (sell_date, sell_price)。若无法取到价格则返回 (None, None)。
     """
-    if symbol_df is None or symbol_df.empty:
-        return False
-    # 取出 <= date 的记录，并按日期排序
-    df = symbol_df[symbol_df['trade_date'] <= date].sort_values('trade_date')
-    if len(df) < n:
-        return False
-    tail = df.tail(n)
-    closes = tail['close'].to_list()
-    # 严格递减
-    for i in range(1, len(closes)):
-        if closes[i] >= closes[i-1]:
-            return False
-    return True
+    mode = (cfg.sell_price_mode or 'next_open').lower().strip()
+    if mode == 'close':
+        sell_price = _get_close(symbol_df, signal_date)
+        if sell_price is None or sell_price <= 0:
+            return None, None
+        return pd.to_datetime(signal_date), float(sell_price)
+
+    # 默认 next_open
+    return _get_next_open(symbol_df, signal_date)
 
 
 def main():
@@ -139,6 +152,15 @@ def main():
     ts = datetime.now().strftime('%Y%m%d_%H%M')
     run_out_dir = os.path.join(cfg.out_dir, ts)
     os.makedirs(run_out_dir, exist_ok=True)
+
+    # 构建止损规则配置（从回测配置映射）
+    sl_cfg = StopLossConfig(
+        stop_loss_drawdown=cfg.stop_loss_drawdown,
+        enable_three_days_down_exit=cfg.enable_three_days_down_exit,
+        enable_early_underperform_exit=cfg.enable_early_underperform_exit,
+        early_exit_hold_days=cfg.early_exit_hold_days,
+        early_exit_min_return=cfg.early_exit_min_return,
+    )
 
     start = pd.to_datetime(cfg.start_date)
     end = pd.to_datetime(cfg.end_date)
@@ -187,84 +209,43 @@ def main():
             end_date=d,
             preloaded=preloaded_all,
             quiet=True,
+            pos_1y_min_pct=sel.CFG.pos_1y_min_pct,
+            pos_1y_max_pct=sel.CFG.pos_1y_max_pct,
+            min_limitup_count=cfg.min_limitup_count,
         )
-        if not df_sel.empty:
-            df_sel = df_sel[df_sel['limit_up_days_1y'] >= int(cfg.min_limitup_count)].copy()
+        # scan_dir 内已统一处理 min_limitup_count，无需额外过滤
 
-        # 开始执行止损检查（按当日收盘价触发，但用下一交易日开盘价成交卖出）
+        # 开始执行止损检查（按当日收盘价触发；成交价可配置：当日收盘 或 次日开盘）
         exits = []
         for sym, pos in list(positions.items()):
             sym_df = price_map.get(sym)
-            close = _get_close(sym_df, d)
-            if close is None:
+
+            should_exit, reasons = evaluate_exit_signal(sl_cfg, sym_df, pos, d)
+            if not should_exit:
                 continue
 
-            # 规则1：持股N天内“累计最高涨幅”未达到阈值则卖出
-            # 解释：到第 N 天（含）才评估：从买入价起算，期间最高收盘价对应的累计涨幅 < threshold，则在下一交易日开盘卖出
-            early_underperform = False
-            if cfg.enable_early_underperform_exit:
-                try:
-                    buy_dt = pd.to_datetime(pos.get('buy_date'))
-                    hold_days = (pd.to_datetime(d) - buy_dt).days
-                    # 仅在“持有满 N 天”的当日触发检查，避免提前卖出
-                    if hold_days is not None and hold_days == int(cfg.early_exit_hold_days):
-                        entry = float(pos.get('entry_price') or 0)
-                        if entry > 0:
-                            # 这里先用当前 close 初始化/更新 peak_close，再计算累计最高涨幅
-                            peak_close_now = max(float(pos.get('peak_close') or close), close)
-                            max_ret = (peak_close_now - entry) / entry
-                            if max_ret < float(cfg.early_exit_min_return):
-                                early_underperform = True
-                except Exception:
-                    early_underperform = False
-
-            # 收盘价最高点回撤止损：从“买入后第一天的收盘价”开始
-            # - 买入当天(成交日)不初始化 peak_close
-            # - 遇到首个有效收盘价（通常是成交日当天的 close）时，初始化 peak_close
-            if 'peak_close' not in pos or pos['peak_close'] is None:
-                pos['peak_close'] = close
-                # peak_close 刚初始化当天，不触发止损判断（相当于从下一次更新开始才比较）
+            # 卖出：根据配置决定成交价
+            sell_date, sell_price = _get_sell_price(cfg, sym_df, d)
+            if sell_date is None or sell_price is None or sell_price <= 0:
+                # 无可用价格则无法成交，跳过
                 continue
 
-            pos['peak_close'] = max(float(pos['peak_close']), close)
-            peak_close = float(pos['peak_close']) if pos['peak_close'] else 0.0
-            drawdown = (peak_close - close) / peak_close if peak_close > 0 else 0.0
+            proceeds = pos['shares'] * sell_price
+            cash += proceeds
+            pnl = (sell_price - pos['entry_price']) * pos['shares']
 
-            # 连续三天下跌卖出条件（可配置开关）
-            three_days_down = False
-            if cfg.enable_three_days_down_exit:
-                three_days_down = _is_last_n_days_all_down(sym_df, d, n=3)
+            reason = '_AND_'.join(reasons) if reasons else 'SELL'
 
-            if drawdown >= cfg.stop_loss_drawdown or three_days_down or early_underperform:
-                # 卖出：按“下一交易日”开盘价成交
-                sell_date, sell_price = _get_next_open(sym_df, d)
-                if sell_date is None or sell_price is None or sell_price <= 0:
-                    # 无下一交易日价格则无法成交，跳过
-                    continue
-
-                proceeds = pos['shares'] * sell_price
-                cash += proceeds
-                pnl = (sell_price - pos['entry_price']) * pos['shares']
-
-                reasons = []
-                if drawdown >= cfg.stop_loss_drawdown:
-                    reasons.append('STOP_LOSS')
-                if three_days_down:
-                    reasons.append('THREE_DAYS_DOWN')
-                if early_underperform:
-                    reasons.append('EARLY_UNDERPERFORM')
-                reason = '_AND_'.join(reasons) if reasons else 'SELL'
-
-                trade_log.append({
-                    'date': sell_date.strftime('%Y-%m-%d'),
-                    'symbol': sym,
-                    'action': 'SELL',
-                    'price': sell_price,
-                    'shares': pos['shares'],
-                    'pnl': round(pnl, 2),
-                    'reason': reason,
-                })
-                exits.append(sym)
+            trade_log.append({
+                'date': sell_date.strftime('%Y-%m-%d'),
+                'symbol': sym,
+                'action': 'SELL',
+                'price': sell_price,
+                'shares': pos['shares'],
+                'pnl': round(pnl, 2),
+                'reason': reason,
+            })
+            exits.append(sym)
         for sym in exits:
             positions.pop(sym, None)
 
@@ -347,38 +328,50 @@ def main():
         pbar.update(1)
     pbar.close()
 
-    # 回测结束：强制平仓（用最后一个交易日的下一交易日开盘价成交，便于计算最终收益）
+    # 回测结束：是否强制平仓（按配置决定）
     if positions:
         last_day = test_days[-1]
-        for sym, pos in list(positions.items()):
-            sym_df = price_map.get(sym)
-            sell_date, sell_price = _get_next_open(sym_df, last_day)
-            if sell_date is None or sell_price is None or sell_price <= 0:
-                # 若缺少下一交易日开盘价，则退化为用最后一日收盘价进行统计性平仓（不改变历史交易过程，仅用于回测汇总）
-                sell_date = last_day
-                sell_price = _get_close(sym_df, last_day) or float(pos.get('peak_close') or pos['entry_price'])
 
-            proceeds = pos['shares'] * sell_price
-            cash += proceeds
-            pnl = (sell_price - pos['entry_price']) * pos['shares']
-            trade_log.append({
+        if cfg.close_open_positions_at_end:
+            # 强制平仓（卖出成交价同样按配置；若缺价则退化为最后一日收盘价用于统计）
+            for sym, pos in list(positions.items()):
+                sym_df = price_map.get(sym)
+                sell_date, sell_price = _get_sell_price(cfg, sym_df, last_day)
+                if sell_date is None or sell_price is None or sell_price <= 0:
+                    # 若缺少可用卖出价，则退化为用最后一日收盘价进行统计性平仓（不改变历史交易过程，仅用于回测汇总）
+                    sell_date = last_day
+                    sell_price = _get_close(sym_df, last_day) or float(pos.get('peak_close') or pos['entry_price'])
+
+                proceeds = pos['shares'] * sell_price
+                cash += proceeds
+                pnl = (sell_price - pos['entry_price']) * pos['shares']
+                trade_log.append({
+                    'date': sell_date.strftime('%Y-%m-%d'),
+                    'symbol': sym,
+                    'action': 'SELL',
+                    'price': sell_price,
+                    'shares': pos['shares'],
+                    'pnl': round(pnl, 2),
+                    'reason': 'FORCE_LIQUIDATION',
+                })
+                positions.pop(sym, None)
+
+            # 追加一条期末权益记录（以强制平仓后的现金作为最终权益）
+            equity_curve.append({
                 'date': sell_date.strftime('%Y-%m-%d'),
-                'symbol': sym,
-                'action': 'SELL',
-                'price': sell_price,
-                'shares': pos['shares'],
-                'pnl': round(pnl, 2),
-                'reason': 'FORCE_LIQUIDATION',
+                'equity': round(cash, 2),
+                'cash': round(cash, 2),
+                'positions': 0,
             })
-            positions.pop(sym, None)
-
-        # 追加一条期末权益记录（以强制平仓后的现金作为最终权益）
-        equity_curve.append({
-            'date': sell_date.strftime('%Y-%m-%d'),
-            'equity': round(cash, 2),
-            'cash': round(cash, 2),
-            'positions': 0,
-        })
+        else:
+            # 不做期末强制平仓：保留持仓到结束
+            # 为了让汇总更清晰，这里仅追加一条“期末仍有持仓”的权益记录（与循环最后一天的权益值一致）
+            equity_curve.append({
+                'date': last_day.strftime('%Y-%m-%d'),
+                'equity': round(equity_curve[-1]['equity'], 2) if equity_curve else round(cash, 2),
+                'cash': round(cash, 2),
+                'positions': len(positions),
+            })
 
     # 汇总输出
     df_equity = pd.DataFrame(equity_curve).sort_values('date')
@@ -553,11 +546,19 @@ def main():
         total_return = (end_equity - start_equity) / start_equity if start_equity > 0 else 0.0
         print(f"资金平均占用率: {avg_capital_usage*100:.2f}% | 总收益率: {total_return*100:.2f}%")
 
-    # 胜率统计
+    # 胜率统计（按“卖出/平仓”为一笔）
     if not df_trades.empty:
-        win_trades = df_trades[df_trades['pnl'] > 0]
-        win_rate = len(win_trades) / len(df_trades) * 100
-        print(f"胜率: {win_rate:.2f}%")
+        df_sells = df_trades[df_trades['action'] == 'SELL'].copy()
+        if not df_sells.empty:
+            win_cnt = int((df_sells['pnl'] > 0).sum())
+            loss_cnt = int((df_sells['pnl'] < 0).sum())
+            even_cnt = int((df_sells['pnl'] == 0).sum())
+            total_cnt = len(df_sells)
+            # 口径：胜率 = 盈利笔数 / (盈利笔数 + 亏损笔数)，不把持平计入分母
+            denom = win_cnt + loss_cnt
+            win_rate = (win_cnt / denom * 100) if denom > 0 else 0.0
+            print(f"平仓统计: 盈利 {win_cnt} | 亏损 {loss_cnt} | 持平 {even_cnt} | 平仓总笔数 {total_cnt}")
+            print(f"胜率(按平仓, 不含持平): {win_rate:.2f}%")
 
     print(f"回测完成：{len(test_days)} 天 | 期末权益: {df_equity['equity'].iloc[-1]:.2f} | 输出目录: {run_out_dir}")
     print(f"无法买入（资金不足/单笔金额不足导致买不起1股）的股票次数: {buy_skip_insufficient_cash}")

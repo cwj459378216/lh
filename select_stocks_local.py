@@ -14,7 +14,12 @@ from dataclasses import dataclass
 class Config:
     # 路径与输出（硬编码）：数据源目录与结果文件路径
     data_dir: str = os.path.join(os.path.dirname(__file__), '通达信', 'data', 'pytdx', 'daily_raw')
-    default_out: str = os.path.join(os.path.dirname(__file__), 'output', 'selection_local.csv')
+    # 默认文件名改为带时间戳，避免多次单独运行覆盖
+    default_out: str = os.path.join(
+        os.path.dirname(__file__),
+        'output',
+        f"selection_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+    )
     date_subdir: bool = True  # 是否按当天日期(YYYYMMDD)创建子文件夹保存输出
     # 市值过滤（单位：元）：总市值区间与是否跳过过滤
     mktcap_min: float = 8e9   # 市值下限，默认80亿
@@ -43,6 +48,11 @@ class Config:
     high_close_tol: float = 0.10
     # 启动质量开关：是否启用启动质量过滤
     enable_start_quality: bool = True
+    # 1年区间位置过滤（单位：%）。None 表示不启用。
+    # pos_1y_min_pct: float | None = 30.0
+    # pos_1y_max_pct: float | None = 65.0
+    pos_1y_min_pct: float | None = None
+    pos_1y_max_pct: float | None = None
     # 单股测试：仅扫描该股票文件名（如 "603598.SH"），None 表示不限制
     test_single_symbol: str | None = None
 
@@ -210,7 +220,10 @@ def scan_dir(data_dir: str,
              only_10pct_a: bool,
              end_date: pd.Timestamp | None = None,
              preloaded: dict[str, pd.DataFrame] | None = None,
-             quiet: bool = False) -> pd.DataFrame:
+             quiet: bool = False,
+             pos_1y_min_pct: float | None = None,
+             pos_1y_max_pct: float | None = None,
+             min_limitup_count: int | None = None) -> pd.DataFrame:
     # 允许传入截断日期（用于回测），默认使用今天
     end_dt = (pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(datetime.today().strftime('%Y-%m-%d')))
     end = end_dt.date()
@@ -292,7 +305,23 @@ def scan_dir(data_dir: str,
                 # 夹在 0~1 范围
                 pos_pct = max(0.0, min(1.0, pos_pct))
 
+        # 1年区间位置过滤（pos_in_1y，单位%）：默认要求 30~65
+        pos_ok = True
+        if pos_1y_min_pct is not None or pos_1y_max_pct is not None:
+            if not isinstance(pos_pct, float):
+                pos_ok = False
+            else:
+                pos_pct100 = pos_pct * 100.0
+                if pos_1y_min_pct is not None:
+                    pos_ok = pos_ok and (pos_pct100 >= pos_1y_min_pct - 1e-9)
+                if pos_1y_max_pct is not None:
+                    pos_ok = pos_ok and (pos_pct100 <= pos_1y_max_pct + 1e-9)
+
         limitup_cnt = count_limit_up_days(bars_all, limitup_threshold)
+
+        # 统一涨停次数门槛：优先使用传入参数，否则退化为全局配置 CFG.min_limitup_count
+        _min_lu = CFG.min_limitup_count if min_limitup_count is None else int(min_limitup_count)
+
         vol_spike = _is_today_volume_spike(bars_all, volume_spike_factor)
         today_up = _is_today_up_pct(bars_all, CFG.up_pct_threshold)
         cont_up_n = _is_last_n_days_all_up(bars_all, CFG.last_n_days_red_n)
@@ -309,11 +338,12 @@ def scan_dir(data_dir: str,
         passed = (
             range_lower - 1e-9 <= rng <= range_upper + 1e-9
             and near_low_enough(last_close, low, near_low_tol)
-            and limitup_cnt >= CFG.min_limitup_count
+            and limitup_cnt >= _min_lu
             and vol_spike
             and extra_cond
             and high_close_ok
             and start_quality
+            and pos_ok
         )
 
         # 单股测试时，如果没通过，打印各条件方便排查
@@ -323,7 +353,7 @@ def scan_dir(data_dir: str,
                     f"[DEBUG] {stem} 未入选原因: "
                     f"振幅={rng:.4f} 是否在区间[{range_lower},{range_upper}]内={range_lower - 1e-9 <= rng <= range_upper + 1e-9}; "
                     f"接近近低={near_low_enough(last_close, low, near_low_tol)}; "
-                    f"近一年涨停天数={limitup_cnt} 是否≥配置门槛{CFG.min_limitup_count}={limitup_cnt >= CFG.min_limitup_count}; "
+                    f"近一年涨停天数={limitup_cnt} 是否≥配置门槛{_min_lu}={limitup_cnt >= _min_lu}; "
                     f"当日放量={vol_spike}; 当日涨幅达标={today_up}; 近{CFG.last_n_days_red_n}天连续上涨={cont_up_n}; "
                     f"当日高收价偏离≤{CFG.high_close_tol*100:.1f}%={high_close_ok}; "
                     f"启动质量(涨+量+收盘≥中轴)={start_quality}; "
@@ -503,6 +533,9 @@ def main():
         only_10pct_a=only_10pct_a,
         end_date=end_date_arg,
         quiet=quiet_arg,
+        pos_1y_min_pct=CFG.pos_1y_min_pct,
+        pos_1y_max_pct=CFG.pos_1y_max_pct,
+        min_limitup_count=min_limitup_count,
     )
 
     if df.empty:
