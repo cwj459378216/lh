@@ -6,3 +6,4 @@
 !.gitignore
 !README.md
 !*.txt
+!wh/*.csv
