@@ -61,6 +61,7 @@ def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, cod
     out: dict = {
         "购买时间": buy_date.strftime("%Y%m%d"),
         "代码": str(code).strip(),
+        "持仓成本": "",
         "收盘最高价": "",
         "止损价格": "",
         "持仓时间": "",
@@ -84,9 +85,19 @@ def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, cod
     hold_days = int((end_date - buy_date).days)
 
     # 逐日评估是否触发平仓
+    # entry_price：按你的规则，持仓成本=购买当天的开盘价；若购买日缺失则取区间首日开盘价（再缺失则回退到首日收盘价）
+    buy_day_df = df2[df2["trade_date"] == buy_date]
+    if not buy_day_df.empty and "open" in buy_day_df.columns:
+        entry_price = float(buy_day_df["open"].iloc[0])
+    elif "open" in df2.columns:
+        entry_price = float(df2["open"].iloc[0])
+    else:
+        entry_price = float(df2["close"].iloc[0])
+
+    out["持仓成本"] = round(entry_price, 4)
+
     pos = {
-        # entry_price 对 EARLY_UNDERPERFORM 规则有用；这里用买入日收盘近似（若买入日缺失则用首日收盘）
-        "entry_price": float(df2["close"].iloc[0]),
+        "entry_price": entry_price,
         "buy_date": buy_date,
         "peak_close": None,
     }
@@ -145,7 +156,7 @@ def main():
     df_in = df_in.fillna("")
 
     # 兼容用户的旧表头（如果缺少列则补）
-    required_cols = ["购买时间", "代码", "收盘最高价", "止损价格", "持仓时间", "是否平仓", "平仓日期", "平仓原因"]
+    required_cols = ["购买时间", "代码", "持仓成本", "收盘最高价", "止损价格", "持仓时间", "是否平仓", "平仓日期", "平仓原因"]
     for c in required_cols:
         if c not in df_in.columns:
             df_in[c] = ""

@@ -27,13 +27,16 @@ class BacktestConfig:
     vol_factor: float = sel.CFG.vol_factor
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
-    start_date: str = '20250901'
+    start_date: str = '20230101'
     end_date: str = '20260106'
     # 回测交易参数
-    initial_capital: float = 100000.0          # 初始资金
-    buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
-    buy_ratio: float = 0.5                      # 按百分比买入时使用的资金比例（相对当前可用资金）
+    initial_capital: float = 37000.0          # 初始资金
+    buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_fixed_amount: float = 4000.0           # 固定金额买入时，每次使用的金额
+
+    # ratio 买入策略附加约束：最多持有 N 只；每只目标仓位 = total_equity * per_position_ratio
+    ratio_max_positions: int = 5
+    ratio_per_position: float = 0.20
 
     # 卖出成交价模式：
     # - 'close': 当天收盘价卖出
@@ -255,6 +258,12 @@ def main():
                 sym = row['symbol']
                 if sym in positions:
                     continue
+
+                # ratio 策略：最多持有 N 只
+                if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                    if len(positions) >= int(cfg.ratio_max_positions):
+                        continue
+
                 sym_df = price_map.get(sym)
                 # 使用下一交易日开盘价作为买入价
                 buy_date, open_price = _get_next_open(sym_df, d)
@@ -262,8 +271,17 @@ def main():
                     continue
 
                 # 根据买入模式计算本次使用资金
-                if cfg.buy_mode == 'ratio':
-                    buy_cash = cash * cfg.buy_ratio
+                if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                    # 每个票占 20% 总权益（按信号日收盘估值的 total_equity；再受限于可用现金）
+                    total_equity = cash
+                    for _sym, _pos in positions.items():
+                        _sym_df = price_map.get(_sym)
+                        _close = _get_close(_sym_df, d)
+                        if _close is None:
+                            _close = float(_pos.get('peak_close') or _pos['entry_price'])
+                        total_equity += _pos['shares'] * _close
+
+                    buy_cash = float(total_equity) * float(cfg.ratio_per_position)
                 else:
                     buy_cash = cfg.buy_fixed_amount
 
