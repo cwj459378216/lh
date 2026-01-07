@@ -27,7 +27,7 @@ class BacktestConfig:
     vol_factor: float = sel.CFG.vol_factor
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
-    start_date: str = '20230101'
+    start_date: str = '20160101'
     end_date: str = '20260106'
     # 回测交易参数
     initial_capital: float = 37000.0          # 初始资金

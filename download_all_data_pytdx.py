@@ -204,7 +204,7 @@ def main():
     _clear_output_dir(args.out)
 
     end = datetime.today().date()
-    start = end - relativedelta(months=36)
+    start = end - relativedelta(months=120)
     start_str = start.strftime('%Y%m%d')
     end_str = end.strftime('%Y%m%d')
 
