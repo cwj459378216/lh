@@ -127,8 +127,8 @@ def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, cod
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default=os.path.join("wh", "止损表.csv"))
-    parser.add_argument("--output", default=os.path.join("wh", "止损表.csv"))
+    parser.add_argument("--input", default=os.path.join("wh", "qyb.csv"))
+    parser.add_argument("--output", default=os.path.join("wh", "qyb.csv"))
     parser.add_argument("--end-date", default=datetime_today_yyyymmdd())
 
     # 止损策略参数（默认沿用 stop_loss_rules.py 默认值）

@@ -95,9 +95,22 @@ def load_csv(path: str) -> pd.DataFrame:
     missing = [c for c in exp if c not in df.columns]
     if missing:
         return pd.DataFrame()
-    # 解析日期并排序
-    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+
+    # 解析日期并排序（兼容 trade_date 为 int/float 导致被误解析成 1970 时间戳的问题）
+    # 预期格式：YYYYMMDD（如 20260112）
+    td_raw = df['trade_date']
+    td_str = td_raw.astype(str).str.strip()
+    td_str = td_str.str.replace(r'\.0$', '', regex=True)
+
+    td = pd.to_datetime(td_str, format='%Y%m%d', errors='coerce')
+    # 若不是 YYYYMMDD（例如带 '-' 或 'YYYY/MM/DD'），则回退通用解析
+    mask = td.isna() & td_str.ne('')
+    if bool(mask.any()):
+        td.loc[mask] = pd.to_datetime(td_str.loc[mask], errors='coerce')
+
+    df['trade_date'] = td
     df = df.dropna(subset=['trade_date']).sort_values('trade_date').reset_index(drop=True)
+
     # 数值列
     for c in ['open', 'high', 'low', 'close', 'volume', 'amount']:
         df[c] = pd.to_numeric(df[c], errors='coerce')
