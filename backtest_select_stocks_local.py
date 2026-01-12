@@ -27,7 +27,7 @@ class BacktestConfig:
     vol_factor: float = sel.CFG.vol_factor
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
-    start_date: str = '20160101'
+    start_date: str = '20250901'
     end_date: str = '20260106'
     # 回测交易参数
     initial_capital: float = 37000.0          # 初始资金
@@ -42,6 +42,13 @@ class BacktestConfig:
     # - 'close': 当天收盘价卖出
     # - 'next_open': 下一交易日开盘价卖出（原逻辑）
     sell_price_mode: str = 'close'
+
+    # --- 交易成本（A股常见）
+    # 你的费率：万0.85（0.000085），取消最低5元，按比例但最低 0.1 元
+    commission_rate: float = 0.000085
+    commission_min: float = 0.1
+    # 印花税：仅卖出收取（你的是 0.05%）
+    stamp_tax_rate_sell: float = 0.0005
 
     stop_loss_drawdown: float = 0.03            # 收盘价回撤止损：相对“最高收盘价”回撤 3%（从买入后第一天收盘价开始）
     enable_three_days_down_exit: bool = False    # 是否启用“连续三天下跌卖出”规则
@@ -149,6 +156,23 @@ def _get_sell_price(cfg: BacktestConfig, symbol_df: pd.DataFrame, signal_date: p
     return _get_next_open(symbol_df, signal_date)
 
 
+def _calc_commission(cfg: BacktestConfig, amount: float) -> float:
+    """佣金：按比例且有最低值。amount 为成交额（正数）。"""
+    amt = max(float(amount or 0.0), 0.0)
+    if amt <= 0:
+        return 0.0
+    fee = amt * float(cfg.commission_rate)
+    return float(max(fee, float(cfg.commission_min)))
+
+
+def _calc_stamp_tax_sell(cfg: BacktestConfig, amount: float) -> float:
+    """印花税：仅卖出收取。amount 为成交额（正数）。"""
+    amt = max(float(amount or 0.0), 0.0)
+    if amt <= 0:
+        return 0.0
+    return float(amt * float(cfg.stamp_tax_rate_sell))
+
+
 def main():
     cfg = CFG
     # 在基础 out_dir 下按当前时间（精确到分钟）创建本次回测的子目录
@@ -234,8 +258,12 @@ def main():
                 continue
 
             proceeds = pos['shares'] * sell_price
-            cash += proceeds
-            pnl = (sell_price - pos['entry_price']) * pos['shares']
+            sell_commission = _calc_commission(cfg, proceeds)
+            sell_stamp_tax = _calc_stamp_tax_sell(cfg, proceeds)
+            sell_cost = sell_commission + sell_stamp_tax
+
+            cash += (proceeds - sell_cost)
+            pnl = (sell_price - pos['entry_price']) * pos['shares'] - float(pos.get('entry_cost', 0.0)) - sell_cost
 
             reason = '_AND_'.join(reasons) if reasons else 'SELL'
 
@@ -247,6 +275,7 @@ def main():
                 'shares': pos['shares'],
                 'pnl': round(pnl, 2),
                 'reason': reason,
+                'fees': round(sell_cost, 2),
             })
             exits.append(sym)
         for sym in exits:
@@ -303,12 +332,21 @@ def main():
                     continue
 
                 cost = shares * open_price
-                cash -= cost
+                buy_commission = _calc_commission(cfg, cost)
+                total_cost = cost + buy_commission
+
+                # 由于佣金包含最低值，total_cost 可能略高于 buy_cash/cash，再次校验
+                if total_cost > cash:
+                    buy_skip_insufficient_cash += 1
+                    continue
+
+                cash -= total_cost
                 positions[sym] = {
                     'shares': shares,
                     'entry_price': open_price,
                     'buy_date': buy_date,   # 成交日（下一交易日）
                     'peak_close': None,     # 不用成本价占位，等待“买入后第一天的收盘价”初始化
+                    'entry_cost': float(buy_commission),  # 买入侧费用计入成本
                 }
                 trade_log.append({
                     'date': buy_date.strftime('%Y-%m-%d'),
@@ -317,6 +355,7 @@ def main():
                     'price': open_price,
                     'shares': shares,
                     'pnl': 0.0,
+                    'fees': round(buy_commission, 2),
                     # 记录“下单日（信号日）”及当日指标，供后续买入汇总直接使用
                     'signal_date': d.strftime('%Y-%m-%d'),
                     'pos_in_1y': (row.get('pos_in_1y') if isinstance(row, dict) else row.get('pos_in_1y')),
@@ -361,8 +400,12 @@ def main():
                     sell_price = _get_close(sym_df, last_day) or float(pos.get('peak_close') or pos['entry_price'])
 
                 proceeds = pos['shares'] * sell_price
-                cash += proceeds
-                pnl = (sell_price - pos['entry_price']) * pos['shares']
+                sell_commission = _calc_commission(cfg, proceeds)
+                sell_stamp_tax = _calc_stamp_tax_sell(cfg, proceeds)
+                sell_cost = sell_commission + sell_stamp_tax
+
+                cash += (proceeds - sell_cost)
+                pnl = (sell_price - pos['entry_price']) * pos['shares'] - float(pos.get('entry_cost', 0.0)) - sell_cost
                 trade_log.append({
                     'date': sell_date.strftime('%Y-%m-%d'),
                     'symbol': sym,
@@ -371,6 +414,7 @@ def main():
                     'shares': pos['shares'],
                     'pnl': round(pnl, 2),
                     'reason': 'FORCE_LIQUIDATION',
+                    'fees': round(sell_cost, 2),
                 })
                 positions.pop(sym, None)
 
@@ -411,6 +455,7 @@ def main():
         'shares': '股数',
         'pnl': '盈亏',
         'reason': '原因',
+        'fees': '税费',
     })
 
     df_equity_cn.to_csv(os.path.join(run_out_dir, '权益曲线.csv'), index=False, encoding='utf-8-sig')
@@ -422,14 +467,14 @@ def main():
         df_sell = df_trades[df_trades['action'] == 'SELL'].copy()
 
         if not df_buy.empty:
-            df_buy = df_buy.rename(columns={'date': 'buy_date', 'price': 'buy_price', 'shares': 'buy_shares'})
+            df_buy = df_buy.rename(columns={'date': 'buy_date', 'price': 'buy_price', 'shares': 'buy_shares', 'fees': 'buy_fees'})
             df_buy['buy_date'] = pd.to_datetime(df_buy['buy_date'], errors='coerce')
             df_buy['buy_price'] = pd.to_numeric(df_buy['buy_price'], errors='coerce')
             df_buy['buy_shares'] = pd.to_numeric(df_buy['buy_shares'], errors='coerce')
             df_buy['buy_amount'] = (df_buy['buy_price'] * df_buy['buy_shares']).round(2)
 
             if not df_sell.empty:
-                df_sell = df_sell.rename(columns={'date': 'sell_date', 'price': 'sell_price', 'shares': 'sell_shares', 'pnl': 'sell_pnl'})
+                df_sell = df_sell.rename(columns={'date': 'sell_date', 'price': 'sell_price', 'shares': 'sell_shares', 'pnl': 'sell_pnl', 'fees': 'sell_fees'})
                 df_sell['sell_date'] = pd.to_datetime(df_sell['sell_date'], errors='coerce')
                 df_sell['sell_price'] = pd.to_numeric(df_sell['sell_price'], errors='coerce')
                 df_sell['sell_shares'] = pd.to_numeric(df_sell['sell_shares'], errors='coerce')
@@ -442,7 +487,7 @@ def main():
                 df_sell['trade_no'] = df_sell.groupby('symbol').cumcount() + 1
 
                 df_buy_summary = df_buy.merge(
-                    df_sell[['symbol', 'trade_no', 'sell_date', 'sell_price', 'sell_pnl', 'reason']],
+                    df_sell[['symbol', 'trade_no', 'sell_date', 'sell_price', 'sell_pnl', 'sell_fees', 'reason']],
                     on=['symbol', 'trade_no'],
                     how='left',
                 )
@@ -454,6 +499,7 @@ def main():
                 df_buy_summary['sell_price'] = pd.NA
                 df_buy_summary['sell_pnl'] = pd.NA
                 df_buy_summary['reason'] = pd.NA
+                df_buy_summary['sell_fees'] = pd.NA
 
             # 是否挣钱：有 sell_pnl 才能判断，否则为 OPEN
             df_buy_summary['is_profit'] = df_buy_summary['sell_pnl'].apply(
@@ -522,11 +568,13 @@ def main():
                 'buy_price',
                 'buy_shares',
                 'buy_amount',
+                'buy_fees',
                 'prev_day_pct',
                 'prev_day_pos_in_1y',
                 'sell_date',
                 'sell_price',
                 'sell_pnl',
+                'sell_fees',
                 'hold_days',
                 'is_profit',
                 'reason',
@@ -542,11 +590,13 @@ def main():
                 'buy_price': '买入价',
                 'buy_shares': '买入股数',
                 'buy_amount': '买入金额',
+                'buy_fees': '买入费用',
                 'prev_day_pct': '前一天涨幅',
                 'prev_day_pos_in_1y': '前一天位置pos_in_1y',
                 'sell_date': '卖出日期',
                 'sell_price': '卖出价',
                 'sell_pnl': '卖出盈亏',
+                'sell_fees': '卖出税费',
                 'hold_days': '持股天数',
                 'is_profit': '是否盈利',
                 'reason': '原因',
@@ -580,6 +630,8 @@ def main():
 
     print(f"回测完成：{len(test_days)} 天 | 期末权益: {df_equity['equity'].iloc[-1]:.2f} | 输出目录: {run_out_dir}")
     print(f"无法买入（资金不足/单笔金额不足导致买不起1股）的股票次数: {buy_skip_insufficient_cash}")
+
+    return run_out_dir
 
 
 if __name__ == '__main__':
