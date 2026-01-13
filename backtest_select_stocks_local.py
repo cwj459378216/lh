@@ -30,8 +30,8 @@ class BacktestConfig:
     start_date: str = '20250901'
     end_date: str = '20260106'
     # 回测交易参数
-    initial_capital: float = 37000.0          # 初始资金
-    buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
+    initial_capital: float = 90000.0          # 初始资金
+    buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_fixed_amount: float = 4000.0           # 固定金额买入时，每次使用的金额
 
     # ratio 买入策略附加约束：最多持有 N 只；每只目标仓位 = total_equity * per_position_ratio
@@ -55,7 +55,7 @@ class BacktestConfig:
 
     # 新增：持股N天内，如果涨幅低于阈值则卖出（按当日收盘触发，下一交易日开盘成交）
     enable_early_underperform_exit: bool = True
-    early_exit_hold_days: int = 7
+    early_exit_hold_days: int = 5
     early_exit_min_return: float = 0.03  # 3%
 
     # 新增：回测结束时，未卖出持仓是否用“最后一日收盘价”进行统计性平仓
@@ -174,230 +174,100 @@ def _calc_stamp_tax_sell(cfg: BacktestConfig, amount: float) -> float:
 
 
 def main():
-    cfg = CFG
-    # 在基础 out_dir 下按当前时间（精确到分钟）创建本次回测的子目录
-    ts = datetime.now().strftime('%Y%m%d_%H%M')
-    run_out_dir = os.path.join(cfg.out_dir, ts)
-    os.makedirs(run_out_dir, exist_ok=True)
+    print('开始回测...')
+    try:
+        cfg = CFG
+        # 在基础 out_dir 下按当前时间（精确到分钟）创建本次回测的子目录
+        ts = datetime.now().strftime('%Y%m%d_%H%M')
+        run_out_dir = os.path.join(cfg.out_dir, ts)
+        os.makedirs(run_out_dir, exist_ok=True)
+        print(f"输出目录: {run_out_dir}")
 
-    # 构建止损规则配置（从回测配置映射）
-    sl_cfg = StopLossConfig(
-        stop_loss_drawdown=cfg.stop_loss_drawdown,
-        enable_three_days_down_exit=cfg.enable_three_days_down_exit,
-        enable_early_underperform_exit=cfg.enable_early_underperform_exit,
-        early_exit_hold_days=cfg.early_exit_hold_days,
-        early_exit_min_return=cfg.early_exit_min_return,
-    )
-
-    start = pd.to_datetime(cfg.start_date)
-    end = pd.to_datetime(cfg.end_date)
-
-    all_days = _available_trading_days(cfg.data_dir)
-    test_days = [d for d in all_days if start <= d <= end]
-    if not test_days:
-        print('指定区间内无交易日')
-        return
-
-    # 交易账户状态
-    cash = cfg.initial_capital
-    positions: dict[str, dict] = {}
-
-    # 数据映射
-    price_map = _load_symbol_map(cfg.data_dir)
-    # 预加载完整CSV用于选股
-    preloaded_all = {}
-    files = [fn for fn in os.listdir(cfg.data_dir) if fn.lower().endswith('.csv')]
-    for fn in files:
-        stem = os.path.splitext(fn)[0]
-        df_full = sel.load_csv(os.path.join(cfg.data_dir, fn))
-        if not df_full.empty:
-            preloaded_all[stem] = df_full
-
-    equity_curve = []
-    trade_log = []
-
-    # 统计：因资金/单笔金额不足导致无法买入的次数
-    buy_skip_insufficient_cash = 0
-
-    pbar = tqdm(total=len(test_days), desc='回测', dynamic_ncols=True)
-    for d in test_days:
-        # 用主逻辑选股（截止当天），静默模式
-        df_sel = sel.scan_dir(
-            data_dir=cfg.data_dir,
-            months_lookback=cfg.months,
-            range_lower=cfg.range_lower,
-            range_upper=cfg.range_upper,
-            near_low_tol=cfg.near_low_tol,
-            limitup_lookback_months=cfg.limitup_months,
-            limitup_threshold=cfg.limitup_threshold,
-            volume_spike_days=cfg.vol_days,
-            volume_spike_factor=cfg.vol_factor,
-            only_10pct_a=cfg.only_10pct_a,
-            end_date=d,
-            preloaded=preloaded_all,
-            quiet=True,
-            pos_1y_min_pct=sel.CFG.pos_1y_min_pct,
-            pos_1y_max_pct=sel.CFG.pos_1y_max_pct,
-            min_limitup_count=cfg.min_limitup_count,
+        # 构建止损规则配置（从回测配置映射）
+        sl_cfg = StopLossConfig(
+            stop_loss_drawdown=cfg.stop_loss_drawdown,
+            enable_three_days_down_exit=cfg.enable_three_days_down_exit,
+            enable_early_underperform_exit=cfg.enable_early_underperform_exit,
+            early_exit_hold_days=cfg.early_exit_hold_days,
+            early_exit_min_return=cfg.early_exit_min_return,
         )
-        # scan_dir 内已统一处理 min_limitup_count，无需额外过滤
 
-        # 开始执行止损检查（按当日收盘价触发；成交价可配置：当日收盘 或 次日开盘）
-        exits = []
-        for sym, pos in list(positions.items()):
-            sym_df = price_map.get(sym)
+        start = pd.to_datetime(cfg.start_date)
+        end = pd.to_datetime(cfg.end_date)
 
-            should_exit, reasons = evaluate_exit_signal(sl_cfg, sym_df, pos, d)
-            if not should_exit:
-                continue
+        print('扫描交易日...')
+        all_days = _available_trading_days(cfg.data_dir)
+        test_days = [d for d in all_days if start <= d <= end]
+        if not test_days:
+            print('指定区间内无交易日')
+            return
 
-            # 卖出：根据配置决定成交价
-            sell_date, sell_price = _get_sell_price(cfg, sym_df, d)
-            if sell_date is None or sell_price is None or sell_price <= 0:
-                # 无可用价格则无法成交，跳过
-                continue
+        # 交易账户状态
+        cash = cfg.initial_capital
+        positions: dict[str, dict] = {}
 
-            proceeds = pos['shares'] * sell_price
-            sell_commission = _calc_commission(cfg, proceeds)
-            sell_stamp_tax = _calc_stamp_tax_sell(cfg, proceeds)
-            sell_cost = sell_commission + sell_stamp_tax
+        # 数据映射
+        print('加载价格数据...')
+        price_map = _load_symbol_map(cfg.data_dir)
 
-            cash += (proceeds - sell_cost)
-            pnl = (sell_price - pos['entry_price']) * pos['shares'] - float(pos.get('entry_cost', 0.0)) - sell_cost
+        # 预加载完整CSV用于选股
+        print('预加载K线数据用于选股...')
+        preloaded_all = {}
+        files = [fn for fn in os.listdir(cfg.data_dir) if fn.lower().endswith('.csv')]
+        for fn in files:
+            stem = os.path.splitext(fn)[0]
+            df_full = sel.load_csv(os.path.join(cfg.data_dir, fn))
+            if not df_full.empty:
+                preloaded_all[stem] = df_full
 
-            reason = '_AND_'.join(reasons) if reasons else 'SELL'
+        equity_curve = []
+        trade_log = []
 
-            trade_log.append({
-                'date': sell_date.strftime('%Y-%m-%d'),
-                'symbol': sym,
-                'action': 'SELL',
-                'price': sell_price,
-                'shares': pos['shares'],
-                'pnl': round(pnl, 2),
-                'reason': reason,
-                'fees': round(sell_cost, 2),
-            })
-            exits.append(sym)
-        for sym in exits:
-            positions.pop(sym, None)
+        # 统计：因资金/单笔金额不足导致无法买入的次数
+        buy_skip_insufficient_cash = 0
 
-        # 买入：对当日选股，若未持有，则按配置的买入模式买入（按下一交易日开盘价成交）
-        if not df_sel.empty:
-            for _, row in df_sel.iterrows():
-                sym = row['symbol']
-                if sym in positions:
-                    continue
+        pbar = tqdm(total=len(test_days), desc='回测', dynamic_ncols=True)
+        for d in test_days:
+            # 用主逻辑选股（截止当天），静默模式
+            df_sel = sel.scan_dir(
+                data_dir=cfg.data_dir,
+                months_lookback=cfg.months,
+                range_lower=cfg.range_lower,
+                range_upper=cfg.range_upper,
+                near_low_tol=cfg.near_low_tol,
+                limitup_lookback_months=cfg.limitup_months,
+                limitup_threshold=cfg.limitup_threshold,
+                volume_spike_days=cfg.vol_days,
+                volume_spike_factor=cfg.vol_factor,
+                only_10pct_a=cfg.only_10pct_a,
+                end_date=d,
+                preloaded=preloaded_all,
+                quiet=True,
+                pos_1y_min_pct=sel.CFG.pos_1y_min_pct,
+                pos_1y_max_pct=sel.CFG.pos_1y_max_pct,
+                min_limitup_count=cfg.min_limitup_count,
+            )
+            # scan_dir 内已统一处理 min_limitup_count，无需额外过滤
 
-                # ratio 策略：最多持有 N 只
-                if (cfg.buy_mode or '').lower().strip() == 'ratio':
-                    if len(positions) >= int(cfg.ratio_max_positions):
-                        continue
-
-                sym_df = price_map.get(sym)
-                # 使用下一交易日开盘价作为买入价
-                buy_date, open_price = _get_next_open(sym_df, d)
-                if buy_date is None or open_price is None or open_price <= 0:
-                    continue
-
-                # 根据买入模式计算本次使用资金
-                if (cfg.buy_mode or '').lower().strip() == 'ratio':
-                    # 每个票占 20% 总权益（按信号日收盘估值的 total_equity；再受限于可用现金）
-                    total_equity = cash
-                    for _sym, _pos in positions.items():
-                        _sym_df = price_map.get(_sym)
-                        _close = _get_close(_sym_df, d)
-                        if _close is None:
-                            _close = float(_pos.get('peak_close') or _pos['entry_price'])
-                        total_equity += _pos['shares'] * _close
-
-                    buy_cash = float(total_equity) * float(cfg.ratio_per_position)
-                else:
-                    buy_cash = cfg.buy_fixed_amount
-
-                buy_cash = min(buy_cash, cash)
-
-                # 固定金额模式：按100股一手取整买入（向下取整到100的整数倍）
-                lot_size = 100
-
-                # 资金不足（或单笔金额设置太小）：连 1 手都买不起
-                if buy_cash <= 0 or buy_cash < open_price * lot_size:
-                    buy_skip_insufficient_cash += 1
-                    continue
-
-                shares = int(buy_cash // open_price)
-                shares = (shares // lot_size) * lot_size
-
-                if shares <= 0:
-                    buy_skip_insufficient_cash += 1
-                    continue
-
-                cost = shares * open_price
-                buy_commission = _calc_commission(cfg, cost)
-                total_cost = cost + buy_commission
-
-                # 由于佣金包含最低值，total_cost 可能略高于 buy_cash/cash，再次校验
-                if total_cost > cash:
-                    buy_skip_insufficient_cash += 1
-                    continue
-
-                cash -= total_cost
-                positions[sym] = {
-                    'shares': shares,
-                    'entry_price': open_price,
-                    'buy_date': buy_date,   # 成交日（下一交易日）
-                    'peak_close': None,     # 不用成本价占位，等待“买入后第一天的收盘价”初始化
-                    'entry_cost': float(buy_commission),  # 买入侧费用计入成本
-                }
-                trade_log.append({
-                    'date': buy_date.strftime('%Y-%m-%d'),
-                    'symbol': sym,
-                    'action': 'BUY',
-                    'price': open_price,
-                    'shares': shares,
-                    'pnl': 0.0,
-                    'fees': round(buy_commission, 2),
-                    # 记录“下单日（信号日）”及当日指标，供后续买入汇总直接使用
-                    'signal_date': d.strftime('%Y-%m-%d'),
-                    'pos_in_1y': (row.get('pos_in_1y') if isinstance(row, dict) else row.get('pos_in_1y')),
-                })
-
-        # 计算当日权益（持仓按收盘价估值）
-        equity = cash
-        for sym, pos in positions.items():
-            sym_df = price_map.get(sym)
-            close = _get_close(sym_df, d)
-            if close is None:
-                # 若无当日价格，则优先用已初始化的 peak_close 兜底，否则用成本价
-                close = float(pos.get('peak_close') or pos['entry_price'])
-            equity += pos['shares'] * close
-        equity_curve.append({'date': d.strftime('%Y-%m-%d'), 'equity': round(equity, 2), 'cash': round(cash, 2), 'positions': len(positions)})
-
-        # 输出每日选择文件
-        out_file = os.path.join(run_out_dir, f"selection_{d.strftime('%Y%m%d')}.csv")
-        if df_sel.empty:
-            # 不输出空CSV
-            pass
-        else:
-            df_sel.sort_values('range_pct').to_csv(out_file, index=False, encoding='utf-8-sig')
-
-        # 简化进度输出，仅显示当前处理到的日期
-        pbar.set_postfix_str(d.strftime('%Y-%m-%d'))
-        pbar.update(1)
-    pbar.close()
-
-    # 回测结束：是否强制平仓（按配置决定）
-    if positions:
-        last_day = test_days[-1]
-
-        if cfg.close_open_positions_at_end:
-            # 强制平仓（卖出成交价同样按配置；若缺价则退化为最后一日收盘价用于统计）
+            # 开始执行止损检查（按当日收盘价触发；成交价可配置：当日收盘 或 次日开盘）
+            exits = []
             for sym, pos in list(positions.items()):
                 sym_df = price_map.get(sym)
-                sell_date, sell_price = _get_sell_price(cfg, sym_df, last_day)
+
+                should_exit, reasons = evaluate_exit_signal(sl_cfg, sym_df, pos, d)
+                if not should_exit:
+                    continue
+
+                # 针对“跌破信号日开盘价止损”：要求在触发日的下一交易日开盘卖出
+                # 其他止损原因仍按 cfg.sell_price_mode 执行
+                if any(('跌破信号日开盘价止损' in r) for r in (reasons or [])):
+                    sell_date, sell_price = _get_next_open(sym_df, d)
+                else:
+                    sell_date, sell_price = _get_sell_price(cfg, sym_df, d)
+
                 if sell_date is None or sell_price is None or sell_price <= 0:
-                    # 若缺少可用卖出价，则退化为用最后一日收盘价进行统计性平仓（不改变历史交易过程，仅用于回测汇总）
-                    sell_date = last_day
-                    sell_price = _get_close(sym_df, last_day) or float(pos.get('peak_close') or pos['entry_price'])
+                    # 无可用价格则无法成交，跳过
+                    continue
 
                 proceeds = pos['shares'] * sell_price
                 sell_commission = _calc_commission(cfg, proceeds)
@@ -406,6 +276,9 @@ def main():
 
                 cash += (proceeds - sell_cost)
                 pnl = (sell_price - pos['entry_price']) * pos['shares'] - float(pos.get('entry_cost', 0.0)) - sell_cost
+
+                reason = '_AND_'.join(reasons) if reasons else 'SELL'
+
                 trade_log.append({
                     'date': sell_date.strftime('%Y-%m-%d'),
                     'symbol': sym,
@@ -413,226 +286,400 @@ def main():
                     'price': sell_price,
                     'shares': pos['shares'],
                     'pnl': round(pnl, 2),
-                    'reason': 'FORCE_LIQUIDATION',
+                    'reason': reason,
                     'fees': round(sell_cost, 2),
                 })
+                exits.append(sym)
+            for sym in exits:
                 positions.pop(sym, None)
 
-            # 追加一条期末权益记录（以强制平仓后的现金作为最终权益）
-            equity_curve.append({
-                'date': sell_date.strftime('%Y-%m-%d'),
-                'equity': round(cash, 2),
-                'cash': round(cash, 2),
-                'positions': 0,
-            })
-        else:
-            # 不做期末强制平仓：保留持仓到结束
-            # 为了让汇总更清晰，这里仅追加一条“期末仍有持仓”的权益记录（与循环最后一天的权益值一致）
-            equity_curve.append({
-                'date': last_day.strftime('%Y-%m-%d'),
-                'equity': round(equity_curve[-1]['equity'], 2) if equity_curve else round(cash, 2),
-                'cash': round(cash, 2),
-                'positions': len(positions),
-            })
+            # 买入：对当日选股，若未持有，则按配置的买入模式买入（按下一交易日开盘价成交）
+            if not df_sel.empty:
+                for _, row in df_sel.iterrows():
+                    sym = row['symbol']
+                    if sym in positions:
+                        continue
 
-    # 汇总输出
-    df_equity = pd.DataFrame(equity_curve).sort_values('date')
-    df_trades = pd.DataFrame(trade_log)
+                    # ratio 策略：最多持有 N 只
+                    if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                        if len(positions) >= int(cfg.ratio_max_positions):
+                            continue
 
-    # 输出列名改为中文标题
-    df_equity_cn = df_equity.rename(columns={
-        'date': '日期',
-        'equity': '总权益',
-        'cash': '现金',
-        'positions': '持仓数量',
-        'cash_ratio': '现金占比',
-    })
-    df_trades_cn = df_trades.rename(columns={
-        'date': '日期',
-        'symbol': '代码',
-        'action': '操作',
-        'price': '价格',
-        'shares': '股数',
-        'pnl': '盈亏',
-        'reason': '原因',
-        'fees': '税费',
-    })
-
-    df_equity_cn.to_csv(os.path.join(run_out_dir, '权益曲线.csv'), index=False, encoding='utf-8-sig')
-    df_trades_cn.to_csv(os.path.join(run_out_dir, '交易记录.csv'), index=False, encoding='utf-8-sig')
-
-    # 额外输出：买入明细 + 是否盈利（不改变交易逻辑，仅基于 trade_log 事后整理）
-    if not df_trades.empty:
-        df_buy = df_trades[df_trades['action'] == 'BUY'].copy()
-        df_sell = df_trades[df_trades['action'] == 'SELL'].copy()
-
-        if not df_buy.empty:
-            df_buy = df_buy.rename(columns={'date': 'buy_date', 'price': 'buy_price', 'shares': 'buy_shares', 'fees': 'buy_fees'})
-            df_buy['buy_date'] = pd.to_datetime(df_buy['buy_date'], errors='coerce')
-            df_buy['buy_price'] = pd.to_numeric(df_buy['buy_price'], errors='coerce')
-            df_buy['buy_shares'] = pd.to_numeric(df_buy['buy_shares'], errors='coerce')
-            df_buy['buy_amount'] = (df_buy['buy_price'] * df_buy['buy_shares']).round(2)
-
-            if not df_sell.empty:
-                df_sell = df_sell.rename(columns={'date': 'sell_date', 'price': 'sell_price', 'shares': 'sell_shares', 'pnl': 'sell_pnl', 'fees': 'sell_fees'})
-                df_sell['sell_date'] = pd.to_datetime(df_sell['sell_date'], errors='coerce')
-                df_sell['sell_price'] = pd.to_numeric(df_sell['sell_price'], errors='coerce')
-                df_sell['sell_shares'] = pd.to_numeric(df_sell['sell_shares'], errors='coerce')
-                df_sell['sell_pnl'] = pd.to_numeric(df_sell['sell_pnl'], errors='coerce')
-
-                # 同一标的可能多次买卖：按时间顺序为每次交易分配序号并配对
-                df_buy = df_buy.sort_values(['symbol', 'buy_date']).copy()
-                df_sell = df_sell.sort_values(['symbol', 'sell_date']).copy()
-                df_buy['trade_no'] = df_buy.groupby('symbol').cumcount() + 1
-                df_sell['trade_no'] = df_sell.groupby('symbol').cumcount() + 1
-
-                df_buy_summary = df_buy.merge(
-                    df_sell[['symbol', 'trade_no', 'sell_date', 'sell_price', 'sell_pnl', 'sell_fees', 'reason']],
-                    on=['symbol', 'trade_no'],
-                    how='left',
-                )
-            else:
-                df_buy = df_buy.sort_values(['symbol', 'buy_date']).copy()
-                df_buy['trade_no'] = df_buy.groupby('symbol').cumcount() + 1
-                df_buy_summary = df_buy.copy()
-                df_buy_summary['sell_date'] = pd.NaT
-                df_buy_summary['sell_price'] = pd.NA
-                df_buy_summary['sell_pnl'] = pd.NA
-                df_buy_summary['reason'] = pd.NA
-                df_buy_summary['sell_fees'] = pd.NA
-
-            # 是否挣钱：有 sell_pnl 才能判断，否则为 OPEN
-            df_buy_summary['is_profit'] = df_buy_summary['sell_pnl'].apply(
-                lambda x: ('OPEN' if pd.isna(x) else ('YES' if float(x) > 0 else ('NO' if float(x) < 0 else 'EVEN')))
-            )
-
-            # 持股天数：卖出日期 - 买入日期（未卖出则为空）
-            _buy_dt = pd.to_datetime(df_buy_summary.get('buy_date'), errors='coerce')
-            _sell_dt = pd.to_datetime(df_buy_summary.get('sell_date'), errors='coerce')
-            df_buy_summary['hold_days'] = (_sell_dt - _buy_dt).dt.days
-
-            # 前一天涨幅：以买入日期的“前一交易日”计算涨幅
-            # - prev1: 买入日前一交易日
-            # - prev2: prev1 的前一交易日
-            # 涨幅 = (close(prev1) - close(prev2)) / close(prev2)
-            def _prev_day_pct(row):
-                try:
-                    sym = row.get('symbol')
-                    buy_date = row.get('buy_date')
-                    if pd.isna(buy_date) or sym is None:
-                        return pd.NA
                     sym_df = price_map.get(sym)
-                    if sym_df is None or sym_df.empty:
-                        return pd.NA
+                    # 使用下一交易日开盘价作为买入价
+                    buy_date, open_price = _get_next_open(sym_df, d)
+                    if buy_date is None or open_price is None or open_price <= 0:
+                        continue
 
-                    dfp = sym_df[['trade_date', 'close']].dropna().sort_values('trade_date').reset_index(drop=True)
-                    buy_dt = pd.to_datetime(buy_date)
-                    # 买入日所在位置
-                    pos_list = dfp.index[dfp['trade_date'] == buy_dt].to_list()
-                    if not pos_list:
-                        return pd.NA
-                    pos = int(pos_list[0])
-                    if pos < 2:
-                        return pd.NA
-                    close_prev1 = float(dfp.loc[pos - 1, 'close'])
-                    close_prev2 = float(dfp.loc[pos - 2, 'close'])
-                    if close_prev2 <= 0:
-                        return pd.NA
-                    return round((close_prev1 - close_prev2) / close_prev2, 6)
-                except Exception:
-                    return pd.NA
+                    # 根据买入模式计算本次使用资金
+                    if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                        # 每个票占 20% 总权益（按信号日收盘估值的 total_equity；再受限于可用现金）
+                        total_equity = cash
+                        for _sym, _pos in positions.items():
+                            _sym_df = price_map.get(_sym)
+                            _close = _get_close(_sym_df, d)
+                            if _close is None:
+                                _close = float(_pos.get('peak_close') or _pos['entry_price'])
+                            total_equity += _pos['shares'] * _close
 
-            df_buy_summary['prev_day_pct'] = df_buy_summary.apply(_prev_day_pct, axis=1)
+                        buy_cash = float(total_equity) * float(cfg.ratio_per_position)
+                    else:
+                        buy_cash = cfg.buy_fixed_amount
 
-            # 前一天的价格在历史的位置 pos_in_1y：直接使用买入信号日的 pos_in_1y（已在 trade_log 里记录，无需重复计算）
-            # 说明：买入是按“信号日 d 的下一交易日开盘”成交，因此“前一天”即信号日 d
-            if 'signal_date' in df_buy_summary.columns:
-                df_buy_summary['signal_date'] = pd.to_datetime(df_buy_summary['signal_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                    buy_cash = min(buy_cash, cash)
 
-            # 将 pos_in_1y 作为“前一天位置pos_in_1y”输出
-            if 'pos_in_1y' in df_buy_summary.columns:
-                df_buy_summary['prev_day_pos_in_1y'] = pd.to_numeric(df_buy_summary['pos_in_1y'], errors='coerce')
+                    # 固定金额模式：按100股一手取整买入（向下取整到100的整数倍）
+                    lot_size = 100
+
+                    # 资金不足（或单笔金额设置太小）：连 1 手都买不起
+                    if buy_cash <= 0 or buy_cash < open_price * lot_size:
+                        buy_skip_insufficient_cash += 1
+                        continue
+
+                    shares = int(buy_cash // open_price)
+                    shares = (shares // lot_size) * lot_size
+
+                    if shares <= 0:
+                        buy_skip_insufficient_cash += 1
+                        continue
+
+                    cost = shares * open_price
+                    buy_commission = _calc_commission(cfg, cost)
+                    total_cost = cost + buy_commission
+
+                    # 由于佣金包含最低值，total_cost 可能略高于 buy_cash/cash，再次校验
+                    if total_cost > cash:
+                        buy_skip_insufficient_cash += 1
+                        continue
+
+                    cash -= total_cost
+                    positions[sym] = {
+                        'shares': shares,
+                        'entry_price': open_price,
+                        'buy_date': buy_date,   # 成交日（下一交易日）
+                        'peak_close': None,     # 不用成本价占位，等待“买入后第一天的收盘价”初始化
+                        'entry_cost': float(buy_commission),  # 买入侧费用计入成本
+                        # 用于止损规则2：跌破信号日开盘价
+                        'signal_date': d,
+                        'signal_open': None,
+                    }
+                    trade_log.append({
+                        'date': buy_date.strftime('%Y-%m-%d'),
+                        'symbol': sym,
+                        'action': 'BUY',
+                        'price': open_price,
+                        'shares': shares,
+                        'pnl': 0.0,
+                        'fees': round(buy_commission, 2),
+                        # 记录“下单日（信号日）”及当日指标，供后续买入汇总直接使用
+                        'signal_date': d.strftime('%Y-%m-%d'),
+                        'pos_1y_min_pct': (row.get('pos_1y_min_pct') if isinstance(row, dict) else row.get('pos_1y_min_pct')),
+                        'pos_1y_max_pct': (row.get('pos_1y_max_pct') if isinstance(row, dict) else row.get('pos_1y_max_pct')),
+                    })
+
+            # 计算当日权益（持仓按收盘价估值）
+            equity = cash
+            for sym, pos in positions.items():
+                sym_df = price_map.get(sym)
+                close = _get_close(sym_df, d)
+                if close is None:
+                    # 若无当日价格，则优先用已初始化的 peak_close 兜底，否则用成本价
+                    close = float(pos.get('peak_close') or pos['entry_price'])
+                equity += pos['shares'] * close
+            equity_curve.append({'date': d.strftime('%Y-%m-%d'), 'equity': round(equity, 2), 'cash': round(cash, 2), 'positions': len(positions)})
+
+            # 不再输出每日选股文件（selection_YYYYMMDD.csv）
+
+            # 简化进度输出，仅显示当前处理到的日期
+            pbar.set_postfix_str(d.strftime('%Y-%m-%d'))
+            pbar.update(1)
+        pbar.close()
+
+        # 回测结束：是否强制平仓（按配置决定）
+        if positions:
+            last_day = test_days[-1]
+
+            if cfg.close_open_positions_at_end:
+                # 强制平仓（卖出成交价同样按配置；若缺价则退化为最后一日收盘价用于统计）
+                for sym, pos in list(positions.items()):
+                    sym_df = price_map.get(sym)
+                    sell_date, sell_price = _get_sell_price(cfg, sym_df, last_day)
+                    if sell_date is None or sell_price is None or sell_price <= 0:
+                        # 若缺少可用卖出价，则退化为用最后一日收盘价进行统计性平仓（不改变历史交易过程，仅用于回测汇总）
+                        sell_date = last_day
+                        sell_price = _get_close(sym_df, last_day) or float(pos.get('peak_close') or pos['entry_price'])
+
+                    proceeds = pos['shares'] * sell_price
+                    sell_commission = _calc_commission(cfg, proceeds)
+                    sell_stamp_tax = _calc_stamp_tax_sell(cfg, proceeds)
+                    sell_cost = sell_commission + sell_stamp_tax
+
+                    cash += (proceeds - sell_cost)
+                    pnl = (sell_price - pos['entry_price']) * pos['shares'] - float(pos.get('entry_cost', 0.0)) - sell_cost
+                    trade_log.append({
+                        'date': sell_date.strftime('%Y-%m-%d'),
+                        'symbol': sym,
+                        'action': 'SELL',
+                        'price': sell_price,
+                        'shares': pos['shares'],
+                        'pnl': round(pnl, 2),
+                        'reason': 'FORCE_LIQUIDATION',
+                        'fees': round(sell_cost, 2),
+                    })
+                    positions.pop(sym, None)
+
+                # 追加一条期末权益记录（以强制平仓后的现金作为最终权益）
+                equity_curve.append({
+                    'date': sell_date.strftime('%Y-%m-%d'),
+                    'equity': round(cash, 2),
+                    'cash': round(cash, 2),
+                    'positions': 0,
+                })
             else:
-                df_buy_summary['prev_day_pos_in_1y'] = pd.NA
+                # 不做期末强制平仓：保留持仓到结束
+                # 为了让汇总更清晰，这里仅追加一条“期末仍有持仓”的权益记录（与循环最后一天的权益值一致）
+                equity_curve.append({
+                    'date': last_day.strftime('%Y-%m-%d'),
+                    'equity': round(equity_curve[-1]['equity'], 2) if equity_curve else round(cash, 2),
+                    'cash': round(cash, 2),
+                    'positions': len(positions),
+                })
 
-            # 格式化日期输出
-            if 'buy_date' in df_buy_summary.columns:
-                df_buy_summary['buy_date'] = df_buy_summary['buy_date'].dt.strftime('%Y-%m-%d')
-            if 'sell_date' in df_buy_summary.columns:
-                df_buy_summary['sell_date'] = pd.to_datetime(df_buy_summary['sell_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+        # 汇总输出
+        df_equity = pd.DataFrame(equity_curve).sort_values('date')
+        df_trades = pd.DataFrame(trade_log)
 
-            cols = [
-                'symbol',
-                'trade_no',
-                'buy_date',
-                'buy_price',
-                'buy_shares',
-                'buy_amount',
-                'buy_fees',
-                'prev_day_pct',
-                'prev_day_pos_in_1y',
-                'sell_date',
-                'sell_price',
-                'sell_pnl',
-                'sell_fees',
-                'hold_days',
-                'is_profit',
-                'reason',
-            ]
-            cols = [c for c in cols if c in df_buy_summary.columns]
-            df_buy_summary = df_buy_summary[cols].sort_values(['symbol', 'trade_no'])
+        # 输出列名改为中文标题
+        df_equity_cn = df_equity.rename(columns={
+            'date': '日期',
+            'equity': '总权益',
+            'cash': '现金',
+            'positions': '持仓数量',
+            'cash_ratio': '现金占比',
+        })
+        df_trades_cn = df_trades.rename(columns={
+            'date': '日期',
+            'symbol': '代码',
+            'action': '操作',
+            'price': '价格',
+            'shares': '股数',
+            'pnl': '盈亏',
+            'reason': '原因',
+            'fees': '税费',
+        })
 
-            # 买入汇总也改为中文标题
-            df_buy_summary_cn = df_buy_summary.rename(columns={
-                'symbol': '代码',
-                'trade_no': '序号',
-                'buy_date': '买入日期',
-                'buy_price': '买入价',
-                'buy_shares': '买入股数',
-                'buy_amount': '买入金额',
-                'buy_fees': '买入费用',
-                'prev_day_pct': '前一天涨幅',
-                'prev_day_pos_in_1y': '前一天位置pos_in_1y',
-                'sell_date': '卖出日期',
-                'sell_price': '卖出价',
-                'sell_pnl': '卖出盈亏',
-                'sell_fees': '卖出税费',
-                'hold_days': '持股天数',
-                'is_profit': '是否盈利',
-                'reason': '原因',
-            })
-            df_buy_summary_cn.to_csv(os.path.join(run_out_dir, '买入汇总.csv'), index=False, encoding='utf-8-sig')
+        df_equity_cn.to_csv(os.path.join(run_out_dir, '权益曲线.csv'), index=False, encoding='utf-8-sig')
+        df_trades_cn.to_csv(os.path.join(run_out_dir, '交易记录.csv'), index=False, encoding='utf-8-sig')
 
-    # 资金占用与收益率统计
-    # 资金占用率 = 1 - 平均(cash / equity)
-    if not df_equity.empty:
-        df_equity['cash_ratio'] = df_equity['cash'] / df_equity['equity'].replace(0, pd.NA)
-        avg_cash_ratio = float(df_equity['cash_ratio'].dropna().mean()) if df_equity['cash_ratio'].notna().any() else 0.0
-        avg_capital_usage = 1.0 - avg_cash_ratio
-        start_equity = float(df_equity['equity'].iloc[0])
-        end_equity = float(df_equity['equity'].iloc[-1])
-        total_return = (end_equity - start_equity) / start_equity if start_equity > 0 else 0.0
-        print(f"资金平均占用率: {avg_capital_usage*100:.2f}% | 总收益率: {total_return*100:.2f}%")
+        # 额外输出：买入明细 + 是否盈利（不改变交易逻辑，仅基于 trade_log 事后整理）
+        if not df_trades.empty:
+            df_buy = df_trades[df_trades['action'] == 'BUY'].copy()
+            df_sell = df_trades[df_trades['action'] == 'SELL'].copy()
 
-    # 胜率统计（按“卖出/平仓”为一笔）
-    if not df_trades.empty:
-        df_sells = df_trades[df_trades['action'] == 'SELL'].copy()
-        if not df_sells.empty:
-            win_cnt = int((df_sells['pnl'] > 0).sum())
-            loss_cnt = int((df_sells['pnl'] < 0).sum())
-            even_cnt = int((df_sells['pnl'] == 0).sum())
-            total_cnt = len(df_sells)
-            # 口径：胜率 = 盈利笔数 / (盈利笔数 + 亏损笔数)，不把持平计入分母
-            denom = win_cnt + loss_cnt
-            win_rate = (win_cnt / denom * 100) if denom > 0 else 0.0
-            print(f"平仓统计: 盈利 {win_cnt} | 亏损 {loss_cnt} | 持平 {even_cnt} | 平仓总笔数 {total_cnt}")
-            print(f"胜率(按平仓, 不含持平): {win_rate:.2f}%")
+            if not df_buy.empty:
+                df_buy = df_buy.rename(columns={'date': 'buy_date', 'price': 'buy_price', 'shares': 'buy_shares', 'fees': 'buy_fees'})
+                df_buy['buy_date'] = pd.to_datetime(df_buy['buy_date'], errors='coerce')
+                df_buy['buy_price'] = pd.to_numeric(df_buy['buy_price'], errors='coerce')
+                df_buy['buy_shares'] = pd.to_numeric(df_buy['buy_shares'], errors='coerce')
+                df_buy['buy_amount'] = (df_buy['buy_price'] * df_buy['buy_shares']).round(2)
 
-    print(f"回测完成：{len(test_days)} 天 | 期末权益: {df_equity['equity'].iloc[-1]:.2f} | 输出目录: {run_out_dir}")
-    print(f"无法买入（资金不足/单笔金额不足导致买不起1股）的股票次数: {buy_skip_insufficient_cash}")
+                if not df_sell.empty:
+                    df_sell = df_sell.rename(columns={'date': 'sell_date', 'price': 'sell_price', 'shares': 'sell_shares', 'pnl': 'sell_pnl', 'fees': 'sell_fees'})
+                    df_sell['sell_date'] = pd.to_datetime(df_sell['sell_date'], errors='coerce')
+                    df_sell['sell_price'] = pd.to_numeric(df_sell['sell_price'], errors='coerce')
+                    df_sell['sell_shares'] = pd.to_numeric(df_sell['sell_shares'], errors='coerce')
+                    df_sell['sell_pnl'] = pd.to_numeric(df_sell['sell_pnl'], errors='coerce')
 
-    return run_out_dir
+                    # 同一标的可能多次买卖：按时间顺序为每次交易分配序号并配对
+                    df_buy = df_buy.sort_values(['symbol', 'buy_date']).copy()
+                    df_sell = df_sell.sort_values(['symbol', 'sell_date']).copy()
+                    df_buy['trade_no'] = df_buy.groupby('symbol').cumcount() + 1
+                    df_sell['trade_no'] = df_sell.groupby('symbol').cumcount() + 1
 
+                    df_buy_summary = df_buy.merge(
+                        df_sell[['symbol', 'trade_no', 'sell_date', 'sell_price', 'sell_pnl', 'sell_fees', 'reason']],
+                        on=['symbol', 'trade_no'],
+                        how='left',
+                    )
+                else:
+                    df_buy = df_buy.sort_values(['symbol', 'buy_date']).copy()
+                    df_buy['trade_no'] = df_buy.groupby('symbol').cumcount() + 1
+                    df_buy_summary = df_buy.copy()
+                    df_buy_summary['sell_date'] = pd.NaT
+                    df_buy_summary['sell_price'] = pd.NA
+                    df_buy_summary['sell_pnl'] = pd.NA
+                    df_buy_summary['reason'] = pd.NA
+                    df_buy_summary['sell_fees'] = pd.NA
+
+                # 是否挣钱：有 sell_pnl 才能判断，否则为 OPEN
+                df_buy_summary['is_profit'] = df_buy_summary['sell_pnl'].apply(
+                    lambda x: ('OPEN' if pd.isna(x) else ('YES' if float(x) > 0 else ('NO' if float(x) < 0 else 'EVEN')))
+                )
+
+                # 持股天数：卖出日期 - 买入日期（未卖出则为空）
+                _buy_dt = pd.to_datetime(df_buy_summary.get('buy_date'), errors='coerce')
+                _sell_dt = pd.to_datetime(df_buy_summary.get('sell_date'), errors='coerce')
+                df_buy_summary['hold_days'] = (_sell_dt - _buy_dt).dt.days
+
+                # 前一天涨幅：以买入日期的“前一交易日”计算涨幅
+                # - prev1: 买入日前一交易日
+                # - prev2: prev1 的前一交易日
+                # 涨幅 = (close(prev1) - close(prev2)) / close(prev2)
+                def _prev_day_pct(row):
+                    try:
+                        sym = row.get('symbol')
+                        buy_date = row.get('buy_date')
+                        if pd.isna(buy_date) or sym is None:
+                            return pd.NA
+                        sym_df = price_map.get(sym)
+                        if sym_df is None or sym_df.empty:
+                            return pd.NA
+
+                        dfp = sym_df[['trade_date', 'close']].dropna().sort_values('trade_date').reset_index(drop=True)
+                        buy_dt = pd.to_datetime(buy_date)
+                        # 买入日所在位置
+                        pos_list = dfp.index[dfp['trade_date'] == buy_dt].to_list()
+                        if not pos_list:
+                            return pd.NA
+                        pos = int(pos_list[0])
+                        if pos < 2:
+                            return pd.NA
+                        close_prev1 = float(dfp.loc[pos - 1, 'close'])
+                        close_prev2 = float(dfp.loc[pos - 2, 'close'])
+                        if close_prev2 <= 0:
+                            return pd.NA
+                        return round((close_prev1 - close_prev2) / close_prev2, 6)
+                    except Exception:
+                        return pd.NA
+
+                df_buy_summary['prev_day_pct'] = df_buy_summary.apply(_prev_day_pct, axis=1)
+
+                # 前一天的价格在历史的位置 pos_in_1y：直接使用买入信号日的 pos_in_1y（已在 trade_log 里记录，无需重复计算）
+                # 说明：买入是按“信号日 d 的下一交易日开盘”成交，因此“前一天”即信号日 d
+                if 'signal_date' in df_buy_summary.columns:
+                    df_buy_summary['signal_date'] = pd.to_datetime(df_buy_summary['signal_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+
+                # 将 pos_in_1y 作为“前一天位置pos_in_1y”输出
+                if 'pos_in_1y' in df_buy_summary.columns:
+                    df_buy_summary['prev_day_pos_in_1y'] = pd.to_numeric(df_buy_summary['pos_in_1y'], errors='coerce')
+                else:
+                    df_buy_summary['prev_day_pos_in_1y'] = pd.NA
+
+                # 格式化日期输出
+                if 'buy_date' in df_buy_summary.columns:
+                    df_buy_summary['buy_date'] = df_buy_summary['buy_date'].dt.strftime('%Y-%m-%d')
+                if 'sell_date' in df_buy_summary.columns:
+                    df_buy_summary['sell_date'] = pd.to_datetime(df_buy_summary['sell_date'], errors='coerce').dt.strftime('%Y-%m-%d')
+
+                cols = [
+                    'symbol',
+                    'trade_no',
+                    'buy_date',
+                    'buy_price',
+                    'buy_shares',
+                    'buy_amount',
+                    'buy_fees',
+                    'prev_day_pct',
+                    'prev_day_pos_in_1y',
+                    'sell_date',
+                    'sell_price',
+                    'sell_pnl',
+                    'sell_fees',
+                    'hold_days',
+                    'is_profit',
+                    'reason',
+                ]
+                cols = [c for c in cols if c in df_buy_summary.columns]
+                df_buy_summary = df_buy_summary[cols].sort_values(['symbol', 'trade_no'])
+
+                # 买入汇总也改为中文标题
+                df_buy_summary_cn = df_buy_summary.rename(columns={
+                    'symbol': '代码',
+                    'trade_no': '序号',
+                    'buy_date': '买入日期',
+                    'buy_price': '买入价',
+                    'buy_shares': '买入股数',
+                    'buy_amount': '买入金额',
+                    'buy_fees': '买入费用',
+                    'prev_day_pct': '前一天涨幅',
+                    'prev_day_pos_in_1y': '前一天位置pos_in_1y',
+                    'sell_date': '卖出日期',
+                    'sell_price': '卖出价',
+                    'sell_pnl': '卖出盈亏',
+                    'sell_fees': '卖出税费',
+                    'hold_days': '持股天数',
+                    'is_profit': '是否盈利',
+                    'reason': '原因',
+                })
+                df_buy_summary_cn.to_csv(os.path.join(run_out_dir, '买入汇总.csv'), index=False, encoding='utf-8-sig')
+
+        # 资金占用与收益率统计（同时写入CSV）
+        summary_rows = []
+        if not df_equity.empty:
+            df_equity['cash_ratio'] = df_equity['cash'] / df_equity['equity'].replace(0, pd.NA)
+            avg_cash_ratio = float(df_equity['cash_ratio'].dropna().mean()) if df_equity['cash_ratio'].notna().any() else 0.0
+            avg_capital_usage = 1.0 - avg_cash_ratio
+            start_equity = float(df_equity['equity'].iloc[0])
+            end_equity = float(df_equity['equity'].iloc[-1])
+            total_return = (end_equity - start_equity) / start_equity if start_equity > 0 else 0.0
+
+            # 最大回撤（按权益曲线 peak-to-trough 计算）
+            eq = pd.to_numeric(df_equity['equity'], errors='coerce')
+            eq = eq.fillna(method='ffill')
+            peak = eq.cummax()
+            dd = (peak - eq) / peak.replace(0, pd.NA)
+            max_drawdown = float(dd.max()) if dd.notna().any() else 0.0
+
+            # 控制台输出（中文）
+            print(f"资金平均占用率: {avg_capital_usage*100:.2f}% | 总收益率: {total_return*100:.2f}% | 最大回撤: {max_drawdown*100:.2f}%")
+
+            # 汇总表（中文字段）
+            summary_rows.append({'指标': '资金平均占用率', '数值': round(avg_capital_usage * 100, 4), '单位': '%'})
+            summary_rows.append({'指标': '总收益率', '数值': round(total_return * 100, 4), '单位': '%'})
+            summary_rows.append({'指标': '最大回撤', '数值': round(max_drawdown * 100, 4), '单位': '%'})
+
+        # 胜率统计（按“卖出/平仓”为一笔）（同时写入CSV）
+        if not df_trades.empty:
+            df_sells = df_trades[df_trades['action'] == 'SELL'].copy()
+            if not df_sells.empty:
+                win_cnt = int((df_sells['pnl'] > 0).sum())
+                loss_cnt = int((df_sells['pnl'] < 0).sum())
+                even_cnt = int((df_sells['pnl'] == 0).sum())
+                total_cnt = len(df_sells)
+                # 口径：胜率 = 盈利笔数 / (盈利笔数 + 亏损笔数)，不把持平计入分母
+                denom = win_cnt + loss_cnt
+                win_rate = (win_cnt / denom * 100) if denom > 0 else 0.0
+
+                # 控制台输出（中文）
+                print(f"平仓统计: 盈利 {win_cnt} | 亏损 {loss_cnt} | 持平 {even_cnt} | 平仓总笔数 {total_cnt}")
+                print(f"胜率(按平仓, 不含持平): {win_rate:.2f}%")
+
+                # 汇总表（中文字段）
+                summary_rows.append({'指标': '平仓盈利笔数', '数值': win_cnt, '单位': '笔'})
+                summary_rows.append({'指标': '平仓亏损笔数', '数值': loss_cnt, '单位': '笔'})
+                summary_rows.append({'指标': '平仓持平笔数', '数值': even_cnt, '单位': '笔'})
+                summary_rows.append({'指标': '平仓总笔数', '数值': total_cnt, '单位': '笔'})
+                summary_rows.append({'指标': '胜率(按平仓, 不含持平)', '数值': round(win_rate, 4), '单位': '%'})
+
+        # 回测完成信息（中文）（同时写入CSV）
+        last_equity_val = float(df_equity['equity'].iloc[-1]) if not df_equity.empty else float(cash)
+        print(f"回测完成：{len(test_days)} 天 | 期末权益: {last_equity_val:.2f} | 输出目录: {run_out_dir}")
+        print(f"无法买入（资金不足/单笔金额不足导致买不起1股）的股票次数: {buy_skip_insufficient_cash}")
+
+        summary_rows.append({'指标': '回测天数', '数值': len(test_days), '单位': '天'})
+        summary_rows.append({'指标': '期末权益', '数值': round(last_equity_val, 2), '单位': '元'})
+        summary_rows.append({'指标': '输出目录', '数值': run_out_dir, '单位': ''})
+        summary_rows.append({'指标': '无法买入次数(资金不足/单笔金额不足)', '数值': buy_skip_insufficient_cash, '单位': '次'})
+
+        if summary_rows:
+            df_summary = pd.DataFrame(summary_rows)
+            df_summary.to_csv(os.path.join(run_out_dir, '回测统计.csv'), index=False, encoding='utf-8-sig')
+
+        return run_out_dir
+    except Exception as e:
+        print('回测运行异常：', repr(e))
+        raise
 
 if __name__ == '__main__':
+    # 直接运行脚本时的入口
     main()

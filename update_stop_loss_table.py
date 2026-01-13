@@ -100,6 +100,10 @@ def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, cod
         "entry_price": entry_price,
         "buy_date": buy_date,
         "peak_close": None,
+        # 对齐止损规则2：把“信号日”按买入日回填（用于表格用途：跌破买入日开盘价）
+        # 如果你有单独的信号日字段，可改为真正的信号日
+        "signal_date": buy_date,
+        "signal_open": float(entry_price) if entry_price else None,
     }
 
     closed = False
@@ -135,6 +139,7 @@ def main():
     parser.add_argument("--stop-loss-drawdown", type=float, default=StopLossConfig().stop_loss_drawdown)
     parser.add_argument("--enable-three-days-down-exit", action="store_true", default=StopLossConfig().enable_three_days_down_exit)
     parser.add_argument("--disable-early-underperform-exit", action="store_true")
+    # 默认从 7 改为 5 个交易日
     parser.add_argument("--early-exit-hold-days", type=int, default=StopLossConfig().early_exit_hold_days)
     parser.add_argument("--early-exit-min-return", type=float, default=StopLossConfig().early_exit_min_return)
 

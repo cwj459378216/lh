@@ -9,6 +9,9 @@ import requests
 import json
 from dataclasses import dataclass
 
+# python [select_stocks_local.py](http://_vscodecontentref_/0) --end-date 20260110
+# python [select_stocks_local.py](http://_vscodecontentref_/0) --end-date 20251013 --debug-symbol 600868.SH
+
 # 统一参数配置（集中管理默认值）
 @dataclass
 class Config:
@@ -236,7 +239,8 @@ def scan_dir(data_dir: str,
              quiet: bool = False,
              pos_1y_min_pct: float | None = None,
              pos_1y_max_pct: float | None = None,
-             min_limitup_count: int | None = None) -> pd.DataFrame:
+             min_limitup_count: int | None = None,
+             debug_symbol: str | None = None) -> pd.DataFrame:
     # 允许传入截断日期（用于回测），默认使用今天
     end_dt = (pd.to_datetime(end_date) if end_date is not None else pd.to_datetime(datetime.today().strftime('%Y-%m-%d')))
     end = end_dt.date()
@@ -265,7 +269,13 @@ def scan_dir(data_dir: str,
         if CFG.test_single_symbol is not None and stem != CFG.test_single_symbol:
             if pbar: pbar.update(1)
             continue
-        # 解析 symbol/code/market
+
+        # 新增：命令行调试单票
+        if debug_symbol is not None and stem != debug_symbol:
+            if pbar: pbar.update(1)
+            continue
+
+        # 解析 symbol/code/market（兼容 preloaded 模式，没有文件名时也能得到 code/market）
         parts = stem.split('.')
         if len(parts) != 2:
             if pbar: pbar.update(1)
@@ -358,6 +368,139 @@ def scan_dir(data_dir: str,
             and start_quality
             and pos_ok
         )
+
+        # 新增：指定 debug_symbol 时，即使未通过也输出原因（配合 --end-date 用来看某天为什么没触发）
+        if debug_symbol is not None and stem == debug_symbol and not quiet:
+            try:
+                # 必选条件（passed 的直接组成）
+                cond_rng = (range_lower - 1e-9 <= rng <= range_upper + 1e-9)
+                cond_near_low = near_low_enough(last_close, low, near_low_tol)
+                cond_limitup = (limitup_cnt >= _min_lu)
+                cond_vol = bool(vol_spike)
+                cond_extra = bool(extra_cond)
+                cond_high_close = bool(high_close_ok)
+                cond_start_q = bool(start_quality)
+                cond_pos = bool(pos_ok)
+
+                # 派生条件（用于理解 extra_cond / start_quality 等内部细节）
+                pct_to_low = None
+                if isinstance(low, (int, float)) and low and low > 0:
+                    pct_to_low = (last_close - low) / low
+
+                # 当日涨幅（用于 today_up）
+                today_pct = None
+                if bars_all is not None and len(bars_all) >= 2:
+                    prev_close = float(bars_all['close'].iloc[-2])
+                    today_close_ = float(bars_all['close'].iloc[-1])
+                    if prev_close > 0:
+                        today_pct = (today_close_ - prev_close) / prev_close
+
+                # 当日量比（用于 vol_spike）
+                vol_ratio = None
+                if bars_all is not None and len(bars_all) >= 2:
+                    prev_vol = float(bars_all['volume'].iloc[-2])
+                    today_vol = float(bars_all['volume'].iloc[-1])
+                    if prev_vol > 0:
+                        vol_ratio = today_vol / prev_vol
+
+                # 高收偏离（用于 high_close_ok）
+                high_close_gap = None
+                if today_close and today_close > 0:
+                    high_close_gap = (today_high - today_close) / today_close
+
+                cutoff_dt = e.strftime('%Y-%m-%d') if hasattr(e, 'strftime') else str(e)
+
+                def _flag(ok: bool) -> str:
+                    return '✅' if ok else '❌'
+
+                print(f"[DEBUG] 截止日期={cutoff_dt} 标的={stem} 入选={passed}")
+                print("[DEBUG] 必选条件（全部满足才会入选）:")
+
+                print(
+                    f"  [{_flag(cond_rng)} 必选] 振幅区间: 近{months_lookback}个月最高/最低 -> rng={(rng*100):.2f}% "
+                    f"要求[{range_lower*100:.2f}%,{range_upper*100:.2f}%]"
+                )
+
+                if pct_to_low is None:
+                    print(
+                        f"  [{_flag(cond_near_low)} 必选] 接近近低: 缺少有效 low 数据（low={low}）"
+                    )
+                else:
+                    print(
+                        f"  [{_flag(cond_near_low)} 必选] 接近近低: (收盘-近{months_lookback}个月最低)/最低 = "
+                        f"({last_close:.3f}-{low:.3f})/{low:.3f} = {pct_to_low*100:.2f}% "
+                        f"要求≤{near_low_tol*100:.2f}%"
+                    )
+
+                print(
+                    f"  [{_flag(cond_limitup)} 必选] 涨停次数: 近{limitup_lookback_months}个月 cnt={limitup_cnt} "
+                    f"门槛≥{_min_lu}（阈值≈{limitup_threshold*100:.2f}%）"
+                )
+
+                if vol_ratio is None:
+                    print(
+                        f"  [{_flag(cond_vol)} 必选] 当日放量: 缺少有效成交量/前一日数据（factor={volume_spike_factor}）"
+                    )
+                else:
+                    print(
+                        f"  [{_flag(cond_vol)} 必选] 当日放量: 量比=今日量/昨量 = {vol_ratio:.2f}x "
+                        f"要求≥{volume_spike_factor:.2f}x"
+                    )
+
+                # extra_cond 内部解释（派生，但 extra_cond 本身是必选）
+                if today_pct is None:
+                    today_pct_str = 'N/A'
+                else:
+                    today_pct_str = f"{today_pct*100:.2f}%（阈值≥{CFG.up_pct_threshold*100:.2f}%）"
+
+                print(
+                    f"  [{_flag(cond_extra)} 必选] 附加条件: (当日放量 且 当日涨幅达标) 或 (近{CFG.last_n_days_red_n}天连续上涨)"
+                )
+                print(
+                    f"      [派生] 当日涨幅: {today_pct_str} -> {'达标' if bool(today_up) else '未达标'}"
+                )
+                print(
+                    f"      [派生] 近{CFG.last_n_days_red_n}天连续上涨: {('是' if bool(cont_up_n) else '否')}"
+                )
+
+                if high_close_gap is None:
+                    print(
+                        f"  [{_flag(cond_high_close)} 必选] 高收偏离: 缺少有效收盘价数据（tol={CFG.high_close_tol*100:.2f}%）"
+                    )
+                else:
+                    print(
+                        f"  [{_flag(cond_high_close)} 必选] 高收偏离: (最高-收盘)/收盘 = "
+                        f"({today_high:.3f}-{today_close:.3f})/{today_close:.3f} = {high_close_gap*100:.2f}% "
+                        f"要求≤{CFG.high_close_tol*100:.2f}%"
+                    )
+
+                # start_quality 内部解释（派生，但 start_quality 本身是必选）
+                mid_price = (today_high + today_low) / 2.0 if today_high > 0 and today_low > 0 else None
+                if mid_price is None:
+                    mid_str = 'N/A'
+                else:
+                    mid_str = f"中轴={(mid_price):.3f}（要求收盘≥中轴）"
+
+                print(
+                    f"  [{_flag(cond_start_q)} 必选] 启动质量: (当日上涨 且 放量 且 收盘≥当日中轴)"
+                )
+                print(
+                    f"      [派生] {mid_str} | 收盘={today_close:.3f}"
+                )
+
+                # pos_ok 当前默认不启用（min/max None），但 pos_ok 仍在 passed 里，因此仍标为必选
+                pos_val_str = 'N/A' if not isinstance(pos_pct, float) else f"{pos_pct*100:.2f}%"
+                print(
+                    f"  [{_flag(cond_pos)} 必选] 一年位置过滤: min={pos_1y_min_pct} max={pos_1y_max_pct} pos={pos_val_str}"
+                )
+
+                # 非条件说明（信息，不影响入选）
+                print("[DEBUG] 说明:")
+                print("  - 上面标记【必选】的条件，是 passed 的组成部分；任何一个为 ❌ 都不会入选")
+                print("  - 标记【派生】的是用于解释必选条件内部计算的中间量，本身不单独决定入选")
+
+            except Exception:
+                pass
 
         # 单股测试时，如果没通过，打印各条件方便排查
         if CFG.test_single_symbol is not None and stem == CFG.test_single_symbol and not passed and not quiet:
@@ -491,11 +634,13 @@ def main():
     # 可选命令行参数：指定截止日期与静默模式
     end_date_arg = None
     quiet_arg = False
+    debug_symbol_arg = None
     try:
         import argparse
         parser = argparse.ArgumentParser(description='本地CSV选股')
         parser.add_argument('--end-date', type=str, help='指定筛选截止日期(YYYYMMDD)，默认今天')
         parser.add_argument('--quiet', action='store_true', help='静默模式，减少日志输出')
+        parser.add_argument('--debug-symbol', type=str, help='调试单票未触发原因，例如 603598.SH（配合 --end-date）')
         args, _ = parser.parse_known_args()
         if args.end_date:
             try:
@@ -503,6 +648,8 @@ def main():
             except Exception:
                 print('end-date 参数格式错误，应为 YYYYMMDD，例如 20250901')
         quiet_arg = bool(args.quiet)
+        if getattr(args, 'debug_symbol', None):
+            debug_symbol_arg = str(args.debug_symbol).strip()
     except Exception:
         pass
 
@@ -549,6 +696,7 @@ def main():
         pos_1y_min_pct=CFG.pos_1y_min_pct,
         pos_1y_max_pct=CFG.pos_1y_max_pct,
         min_limitup_count=min_limitup_count,
+        debug_symbol=debug_symbol_arg,
     )
 
     if df.empty:
