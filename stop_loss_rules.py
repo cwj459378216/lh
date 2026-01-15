@@ -38,13 +38,18 @@ class StopLossConfig:
     # 跌破“信号日开盘价”止损（买入信号日的 open 作为底线）
     enable_signal_open_stop: bool = True
 
-    # 持股N天内“累计最高涨幅”未达到阈值则卖出
+    # 持股若干交易日内“累计最高涨幅”未达到阈值则卖出（动态规则）
+    # 规则：每 step_days 个交易日，最低涨幅门槛增加 step_min_return
+    # 例：step_days=5, step_min_return=0.03
+    # - 第 5 个交易日：<3% 触发
+    # - 第10 个交易日：<6% 触发
+    # - 第15 个交易日：<9% 触发
     enable_early_underperform_exit: bool = True
-    early_exit_hold_days: int = 5
-    early_exit_min_return: float = 0.03
+    early_exit_step_days: int = 5
+    early_exit_step_min_return: float = 0.03
 
-    # 新增：早期弱势卖出展期
-    # - 在 early_exit_hold_days 交易日时，如果其中“收红天数”>= red_days_threshold，则将考核日延后 extend_days 个交易日
+    # 新增：早期弱势卖出展期（仍基于“首个考核窗口”）
+    # - 在 early_exit_step_days 交易日时，如果其中“收红天数”>= red_days_threshold，则将考核日延后 extend_days 个交易日
     enable_early_exit_extend_on_red_days: bool = False
     early_exit_extend_red_days_threshold: int = 3
     early_exit_extend_days: int = 2
@@ -164,7 +169,6 @@ def evaluate_exit_signal(
 
     返回:
     - (should_exit, reasons)
-      reasons 可能包含: STOP_LOSS / THREE_DAYS_DOWN / EARLY_UNDERPERFORM
 
     说明:
     - 本函数会“更新/初始化 pos['peak_close']”（与原回测保持一致）。
@@ -204,38 +208,60 @@ def evaluate_exit_signal(
         except Exception:
             pass
 
-    # 规则3：购买后 N 个交易日内，累计最高涨幅未达到阈值则卖出（从自然日改为交易日）
+    # 规则3：早期弱势卖出（动态门槛：每 5 个交易日 +3%）
     if cfg.enable_early_underperform_exit:
         try:
             buy_dt = pd.to_datetime(pos.get('buy_date'))
             hold_td = _count_trading_days_inclusive(symbol_df, buy_dt, pd.to_datetime(date))
 
-            # 计算“最终考核交易日数”：默认 N
-            eval_td = int(cfg.early_exit_hold_days)
+            step_days = int(getattr(cfg, 'early_exit_step_days', 5) or 5)
+            step_min_ret = float(getattr(cfg, 'early_exit_step_min_return', 0.03) or 0.03)
+            if step_days <= 0:
+                step_days = 5
+            if step_min_ret <= 0:
+                step_min_ret = 0.03
 
-            # 若开启展期：在第 N 个交易日时，如果区间内收红天数>=阈值，则延后 K 个交易日再考核
-            if bool(cfg.enable_early_exit_extend_on_red_days):
-                try:
-                    if hold_td == int(cfg.early_exit_hold_days):
-                        red_cnt = _count_red_days_inclusive(symbol_df, buy_dt, pd.to_datetime(date))
-                        if red_cnt >= int(cfg.early_exit_extend_red_days_threshold):
-                            eval_td = int(cfg.early_exit_hold_days) + int(cfg.early_exit_extend_days)
-                            pos['early_exit_extended'] = True
-                            pos['early_exit_extended_red_cnt'] = int(red_cnt)
-                except Exception:
-                    pass
+            # 第几个考核点：1->第 step_days 天；2->第 2*step_days 天...
+            k = hold_td // step_days
+            # 只在“整点交易日”触发判断（5/10/15...）
+            if hold_td > 0 and (hold_td % step_days == 0) and k >= 1:
+                # 只触发一次：同一考核点不重复触发
+                last_k = pos.get('early_exit_checked_k')
+                if last_k is None or int(last_k) < int(k):
+                    pos['early_exit_checked_k'] = int(k)
 
-            # 到达考核日才真正判断（只触发一次）
-            if hold_td == eval_td:
-                if not bool(pos.get('early_exit_checked')):
-                    pos['early_exit_checked'] = True
+                    # 可选展期：仅在第一个考核窗口（k==1）处理
+                    if bool(cfg.enable_early_exit_extend_on_red_days) and int(k) == 1:
+                        try:
+                            red_cnt = _count_red_days_inclusive(symbol_df, buy_dt, pd.to_datetime(date))
+                            if red_cnt >= int(cfg.early_exit_extend_red_days_threshold):
+                                # 标记展期，并跳过本次判断；后续在 hold_td == step_days + extend_days 时再判断一次
+                                pos['early_exit_extended'] = True
+                                pos['early_exit_extended_red_cnt'] = int(red_cnt)
+                                pos['early_exit_extend_until_td'] = int(step_days) + int(cfg.early_exit_extend_days)
+                                # 这里 return 不触发，等待展期日再评估
+                                pass
+                        except Exception:
+                            pass
+
+                    extend_until_td = pos.get('early_exit_extend_until_td')
+                    if extend_until_td is not None:
+                        try:
+                            if int(hold_td) != int(extend_until_td):
+                                # 尚未到展期日，不做阈值判断
+                                extend_until_td = None
+                        except Exception:
+                            extend_until_td = None
+
+                    # 计算当期门槛（k * step_min_ret）
+                    min_ret_thr = float(k) * float(step_min_ret)
 
                     entry = float(pos.get('entry_price') or 0)
                     if entry > 0:
-                        peak_close_now = max(float(pos.get('peak_close') or close), close)
+                        peak_close_now = max(float(pos.get('peak_close') or close), float(close))
                         max_ret = (peak_close_now - entry) / entry
-                        if max_ret < float(cfg.early_exit_min_return):
-                            reasons.append(_reason_cn('EARLY_UNDERPERFORM'))
+                        if max_ret < min_ret_thr:
+                            reasons.append(f"{_reason_cn('EARLY_UNDERPERFORM')}(第{hold_td}交易日阈值{min_ret_thr*100:.1f}%)")
         except Exception:
             pass
 

@@ -9,8 +9,8 @@ import requests
 import json
 from dataclasses import dataclass
 
-# python [select_stocks_local.py](http://_vscodecontentref_/0) --end-date 20260110
-# python [select_stocks_local.py](http://_vscodecontentref_/0) --end-date 20251013 --debug-symbol 600868.SH
+# python select_stocks_local.py --end-date 20260110
+# python select_stocks_local.py --end-date 20251013 --debug-symbol 600868.SH
 
 # 统一参数配置（集中管理默认值）
 @dataclass
@@ -39,6 +39,18 @@ class Config:
     vol_days: int = 5                 # 放量考察天数（当前逻辑已不用最近n天，而是当日 vs 前一日）
     vol_factor: float = 2           # 放量倍数阈值（当日成交量≥前一日X倍）
     only_10pct_a: bool = True         # 是否仅保留10%涨停上限A股常见前缀
+
+    # 新增：价格区间过滤（排除某些买入价区间）
+    # exclude_price_ranges: list[tuple[float, float]] = ()
+    # 例如 [(15,20),(25,30)] 表示排除 [15,20) 与 [25,30)
+    exclude_price_ranges: list[tuple[float, float]] = ()
+
+    # 新增：一年内位置过滤（排除某些位置区间，单位：%）
+    # 例如 [(60, 1e9)] 表示排除 [60, +inf)
+    # 例如 [(60, 70), (80, 90)] 表示排除 [60,70) 与 [80,90)
+    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10),(90.0, 1e9))
+    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
+
     # 估值过滤（PE-TTM）：估值上下限，None 表示不限制
     pe_min: float | None = None       # PE(TTM)下限，例如10.0
     pe_max: float | None = None       # PE(TTM)上限，例如40.0
@@ -86,6 +98,257 @@ CFG = Config()
 # 仅保留 A 股中 10% 涨停上限常见前缀（不含 B 股）
 ALLOW_PREFIXES_10P_SH = ("600", "601", "603", "605")  # 沪A
 ALLOW_PREFIXES_10P_SZ = ("000", "001", "002", "003")  # 深A
+
+# --- 打分配置（来自回测汇总输出）
+# 说明：以下胜率/平均盈亏来自你贴的统计表。若以后你更新统计，只需改这里即可。
+PRICE_SEG_STATS = {
+    "0-5": {"win_rate": 0.547619, "avg_pnl": 199.949000},
+    "5-10": {"win_rate": 0.420000, "avg_pnl": 42.254467},
+    "10-15": {"win_rate": 0.543478, "avg_pnl": 113.287826},
+    "15-20": {"win_rate": 0.440476, "avg_pnl": -23.591905},
+    "20-25": {"win_rate": 0.475000, "avg_pnl": -0.002250},
+    "25-30": {"win_rate": 0.352941, "avg_pnl": -75.239118},
+    "30+": {"win_rate": 0.444444, "avg_pnl": 44.042407},
+}
+
+POS_SEG_STATS = {
+    "<0": {"win_rate": None, "avg_pnl": None},
+    "0-10": {"win_rate": 0.388889, "avg_pnl": -11.345333},
+    "10-20": {"win_rate": 0.464481, "avg_pnl": 68.579399},
+    "20-30": {"win_rate": 0.478873, "avg_pnl": 96.020634},
+    "30-40": {"win_rate": 0.500000, "avg_pnl": 69.060844},
+    "40-50": {"win_rate": 0.555556, "avg_pnl": 129.442302},
+    "50-60": {"win_rate": 0.483871, "avg_pnl": 45.827204},
+    "60-70": {"win_rate": 0.404762, "avg_pnl": 121.017143},
+    "70-80": {"win_rate": 0.428571, "avg_pnl": 378.411905},
+    "80-90": {"win_rate": 0.222222, "avg_pnl": -140.286667},
+    "90-100": {"win_rate": None, "avg_pnl": None},
+    "100+": {"win_rate": None, "avg_pnl": None},
+}
+
+SIG_STATS = {
+    "否": {"win_rate": 0.480055, "avg_pnl": 90.855681},
+    "是": {"win_rate": 0.443609, "avg_pnl": 15.681353},
+}
+
+# 评分归一化：满分 100 分
+# - 方法：为每一类（股价段/一年位置段/三连涨信号）先算一个 0~100 的“类别分”，再按权重累加成总分（0~100）
+# - 总分是固定标尺（跨批次可比），不再对“本次选股结果”做 min-max
+SCORE_MAX = 100.0
+SCORE_MIN = 0.0
+SCORE_FLAT_DEFAULT = 50.0
+
+# 三项权重：股价段 / 一年位置段 / 三连涨信号
+W_PRICE = 0.4
+W_POS = 0.4
+W_SIG = 0.2
+
+# 类别内：胜率/均盈亏权重
+W_WIN_IN_CAT = 0.7
+W_PNL_IN_CAT = 0.3
+
+
+def _min_max_normalize(series: pd.Series, vmin: float = SCORE_MIN, vmax: float = SCORE_MAX, flat_default: float = SCORE_FLAT_DEFAULT) -> pd.Series:
+    s = pd.to_numeric(series, errors='coerce')
+    if s.dropna().empty:
+        return pd.Series([flat_default] * len(series), index=series.index, dtype=float)
+
+    mn = float(s.min())
+    mx = float(s.max())
+    if mx - mn <= 1e-12:
+        return pd.Series([flat_default] * len(series), index=series.index, dtype=float)
+
+    out = (s - mn) / (mx - mn) * (vmax - vmin) + vmin
+    return out.astype(float)
+
+
+def _min_max_norm_value(x: float | None, vmin_x: float | None, vmax_x: float | None, out_min: float = SCORE_MIN, out_max: float = SCORE_MAX, flat_default: float = SCORE_FLAT_DEFAULT) -> float:
+    """把单个标量 x 做 min-max 映射到 [out_min, out_max]。
+
+    - x 或 min/max 缺失 -> flat_default
+    - vmax==vmin -> flat_default
+    - 结果会 clip 到区间内
+    """
+    if x is None or pd.isna(x) or vmin_x is None or vmax_x is None:
+        return float(flat_default)
+    try:
+        mn = float(vmin_x)
+        mx = float(vmax_x)
+        if mx - mn <= 1e-12:
+            return float(flat_default)
+        v = (float(x) - mn) / (mx - mn) * (out_max - out_min) + out_min
+        v = max(float(out_min), min(float(out_max), float(v)))
+        return float(v)
+    except Exception:
+        return float(flat_default)
+
+
+def _stats_min_max(stats: dict) -> dict[str, tuple[float | None, float | None]]:
+    """从某一类 stats（PRICE_SEG_STATS/POS_SEG_STATS/SIG_STATS）里抽取 win_rate / avg_pnl 的 min/max。"""
+    wrs: list[float] = []
+    pnls: list[float] = []
+    for _, v in (stats or {}).items():
+        if not isinstance(v, dict):
+            continue
+        wr = v.get('win_rate')
+        pnl = v.get('avg_pnl')
+        if wr is not None and not pd.isna(wr):
+            wrs.append(float(wr))
+        if pnl is not None and not pd.isna(pnl):
+            pnls.append(float(pnl))
+
+    wr_min = min(wrs) if wrs else None
+    wr_max = max(wrs) if wrs else None
+    pnl_min = min(pnls) if pnls else None
+    pnl_max = max(pnls) if pnls else None
+    return {
+        'win_rate': (wr_min, wr_max),
+        'avg_pnl': (pnl_min, pnl_max),
+    }
+
+
+# 预先计算各类别内部的 min/max，用于固定标尺 0~100
+_PRICE_MM = _stats_min_max(PRICE_SEG_STATS)
+_POS_MM = _stats_min_max(POS_SEG_STATS)
+_SIG_MM = _stats_min_max(SIG_STATS)
+
+
+def _score_category(win_rate: float | None, avg_pnl: float | None, mm: dict[str, tuple[float | None, float | None]], w_win: float = W_WIN_IN_CAT, w_pnl: float = W_PNL_IN_CAT) -> tuple[float, float, float]:
+    """按某一类的统计表，把(胜率,均盈亏) -> (类别分, 胜率子分, 均盈亏子分)，全部 0~100。"""
+    wr_min, wr_max = mm.get('win_rate', (None, None))
+    pnl_min, pnl_max = mm.get('avg_pnl', (None, None))
+
+    win_score = _min_max_norm_value(win_rate, wr_min, wr_max, out_min=SCORE_MIN, out_max=SCORE_MAX, flat_default=SCORE_FLAT_DEFAULT)
+    pnl_score = _min_max_norm_value(avg_pnl, pnl_min, pnl_max, out_min=SCORE_MIN, out_max=SCORE_MAX, flat_default=SCORE_FLAT_DEFAULT)
+
+    cat_score = float(w_win) * float(win_score) + float(w_pnl) * float(pnl_score)
+    cat_score = max(SCORE_MIN, min(SCORE_MAX, cat_score))
+    return float(cat_score), float(win_score), float(pnl_score)
+
+
+def _format_seg_value(seg: str | None) -> str:
+    return "N/A" if seg is None else str(seg)
+
+
+def _price_segment(price: float | None) -> str | None:
+    if price is None or pd.isna(price):
+        return None
+    p = float(price)
+    if p < 5:
+        return "0-5"
+    if p < 10:
+        return "5-10"
+    if p < 15:
+        return "10-15"
+    if p < 20:
+        return "15-20"
+    if p < 25:
+        return "20-25"
+    if p < 30:
+        return "25-30"
+    return "30+"
+
+
+def _pos_segment_pct(pos_pct: float | None) -> str | None:
+    if pos_pct is None or pd.isna(pos_pct):
+        return None
+    v = float(pos_pct)
+    if v < 0:
+        return "<0"
+    if v < 10:
+        return "0-10"
+    if v < 20:
+        return "10-20"
+    if v < 30:
+        return "20-30"
+    if v < 40:
+        return "30-40"
+    if v < 50:
+        return "40-50"
+    if v < 60:
+        return "50-60"
+    if v < 70:
+        return "60-70"
+    if v < 80:
+        return "70-80"
+    if v < 90:
+        return "80-90"
+    if v < 100:
+        return "90-100"
+    return "100+"
+
+
+def _norm_score_from_win_rate(win_rate: float | None, base: float = 0.5, scale: float = 100.0) -> float:
+    """把胜率映射成分数：0.5=0分，+/-0.1=+/-10分（可调）。"""
+    if win_rate is None or pd.isna(win_rate):
+        return 0.0
+    return float((float(win_rate) - base) * scale)
+
+
+def _norm_score_from_avg_pnl(avg_pnl: float | None, scale: float = 10.0) -> float:
+    """把平均盈亏映射成分数：avg_pnl/scale（可调）。"""
+    if avg_pnl is None or pd.isna(avg_pnl):
+        return 0.0
+    try:
+        return float(float(avg_pnl) / float(scale))
+    except Exception:
+        return 0.0
+
+
+def score_row_by_backtest_stats(last_close: float | None, pos_in_1y_pct: float | None, last3_up: bool | None) -> tuple[float, str]:
+    """根据回测统计表为单条选股结果打分。
+
+    返回：
+    - raw_score: 固定标尺总分（0~100，跨批次可比）
+    - reason: 可读原因（包含三项类别分及其子分）
+    """
+    # 1) 股价区间
+    price_seg = _price_segment(last_close)
+    pstat = PRICE_SEG_STATS.get(price_seg or "", {})
+    p_wr = pstat.get("win_rate")
+    p_pnl = pstat.get("avg_pnl")
+
+    # 2) 一年内位置区间
+    pos_seg = _pos_segment_pct(pos_in_1y_pct)
+    ostat = POS_SEG_STATS.get(pos_seg or "", {})
+    o_wr = ostat.get("win_rate")
+    o_pnl = ostat.get("avg_pnl")
+
+    # 3) 三连涨信号
+    sig_key = "是" if bool(last3_up) else "否"
+    sstat = SIG_STATS.get(sig_key, {})
+    s_wr = sstat.get("win_rate")
+    s_pnl = sstat.get("avg_pnl")
+
+    # --- 分项打分（每类内部先归一化到 0~100，再按权重累加成总分 0~100）
+    score_price, score_price_win, score_price_pnl = _score_category(p_wr, p_pnl, _PRICE_MM)
+    score_pos, score_pos_win, score_pos_pnl = _score_category(o_wr, o_pnl, _POS_MM)
+    score_sig, score_sig_win, score_sig_pnl = _score_category(s_wr, s_pnl, _SIG_MM)
+
+    raw_score = (
+        float(W_PRICE) * float(score_price)
+        + float(W_POS) * float(score_pos)
+        + float(W_SIG) * float(score_sig)
+    )
+    raw_score = max(SCORE_MIN, min(SCORE_MAX, float(raw_score)))
+
+    # --- 原因文本（带上分项分数，方便校验）
+    reasons: list[str] = []
+    reasons.append(
+        f"股价区间={_format_seg_value(price_seg)}(胜率={('N/A' if p_wr is None else round(float(p_wr)*100,2))}%,均盈亏={('N/A' if p_pnl is None else round(float(p_pnl),2))})"
+        f"=> 类别分={score_price:.2f}(胜率分={score_price_win:.2f},盈亏分={score_price_pnl:.2f},权重={W_PRICE})"
+    )
+    reasons.append(
+        f"一年位置={_format_seg_value(pos_seg)}(胜率={('N/A' if o_wr is None else round(float(o_wr)*100,2))}%,均盈亏={('N/A' if o_pnl is None else round(float(o_pnl),2))})"
+        f"=> 类别分={score_pos:.2f}(胜率分={score_pos_win:.2f},盈亏分={score_pos_pnl:.2f},权重={W_POS})"
+    )
+    reasons.append(
+        f"三连涨信号={sig_key}(胜率={('N/A' if s_wr is None else round(float(s_wr)*100,2))}%,均盈亏={('N/A' if s_pnl is None else round(float(s_pnl),2))})"
+        f"=> 类别分={score_sig:.2f}(胜率分={score_sig_win:.2f},盈亏分={score_sig_pnl:.2f},权重={W_SIG})"
+    )
+    reasons.append(f"总分={raw_score:.2f}（固定标尺0~100）")
+
+    return float(round(raw_score, 6)), "；".join(reasons)
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -224,6 +487,24 @@ def _is_last_n_days_all_up(df: pd.DataFrame, n: int = CFG.last_n_days_red_n) -> 
     return bool((pct > 0).all())
 
 
+def _in_any_range(value: float, ranges: list[tuple[float, float]]) -> bool:
+    """是否落在任意一个区间 [lo, hi)。"""
+    if value is None or pd.isna(value):
+        return False
+    for lo, hi in ranges or []:
+        try:
+            if float(lo) <= float(value) < float(hi):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _in_any_price_range(price: float, ranges: list[tuple[float, float]]) -> bool:
+    """是否落在任意一个区间 [lo, hi)。"""
+    return _in_any_range(price, ranges)
+
+
 def scan_dir(data_dir: str,
              months_lookback: int,
              range_lower: float,
@@ -310,6 +591,11 @@ def scan_dir(data_dir: str,
             if pbar: pbar.update(1)
             continue
 
+        # 新增：股价区间过滤（排除指定价格段）
+        price_ok = True
+        if CFG.exclude_price_ranges:
+            price_ok = not _in_any_price_range(last_close, list(CFG.exclude_price_ranges))
+
         # 计算当日 K 线实体位置约束：最高价与收盘价偏离不超过 CFG.high_close_tol
         today_high = float(bars_3m['high'].iloc[-1])
         today_low = float(bars_3m['low'].iloc[-1])
@@ -327,6 +613,16 @@ def scan_dir(data_dir: str,
                 pos_pct = (last_close - low_1y) / (high_1y - low_1y)
                 # 夹在 0~1 范围
                 pos_pct = max(0.0, min(1.0, pos_pct))
+
+        # 新增：一年内位置区间过滤（可配置多个排除段）
+        # 过滤逻辑：若 pos_pct 无法计算 -> 不通过；若落在任意排除段 -> 不通过
+        pos_exclude_ok = True
+        if CFG.exclude_pos_1y_ranges_pct:
+            if not isinstance(pos_pct, float):
+                pos_exclude_ok = False
+            else:
+                pos_pct100 = pos_pct * 100.0
+                pos_exclude_ok = not _in_any_range(pos_pct100, list(CFG.exclude_pos_1y_ranges_pct))
 
         # 1年区间位置过滤（pos_in_1y，单位%）：默认要求 30~65
         pos_ok = True
@@ -367,6 +663,8 @@ def scan_dir(data_dir: str,
             and high_close_ok
             and start_quality
             and pos_ok
+            and price_ok
+            and pos_exclude_ok
         )
 
         # 新增：指定 debug_symbol 时，即使未通过也输出原因（配合 --end-date 用来看某天为什么没触发）
@@ -513,12 +811,20 @@ def scan_dir(data_dir: str,
                     f"当日放量={vol_spike}; 当日涨幅达标={today_up}; 近{CFG.last_n_days_red_n}天连续上涨={cont_up_n}; "
                     f"当日高收价偏离≤{CFG.high_close_tol*100:.1f}%={high_close_ok}; "
                     f"启动质量(涨+量+收盘≥中轴)={start_quality}; "
-                    f"附加条件整体={extra_cond}"
+                    f"附加条件整体={extra_cond}; "
+                    f"价格过滤(排除{list(CFG.exclude_price_ranges)})={price_ok}; "
+                    f"一年内位置过滤(排除{list(CFG.exclude_pos_1y_ranges_pct)})={pos_exclude_ok}"
                 )
             except Exception:
                 pass
 
         if passed:
+            _raw_score, _reason = score_row_by_backtest_stats(
+                last_close=last_close,
+                pos_in_1y_pct=(pos_pct * 100.0 if isinstance(pos_pct, float) else None),
+                last3_up=_is_last_n_days_all_up(bars_all, CFG.last_n_days_red_n),
+            )
+
             results.append({
                 'symbol': stem,
                 'code': code,
@@ -534,6 +840,9 @@ def scan_dir(data_dir: str,
                 'today_up_ge_3pct': _is_today_up_pct(bars_all, CFG.up_pct_threshold),
                 # 可选：输出启动质量标志
                 'start_quality': bool(start_quality),
+                # 新增：评分（原始得分，后续会归一化成 0~100）
+                'raw_score': _raw_score,
+                'score_reason': _reason,
             })
             found += 1
             if not quiet:
@@ -703,6 +1012,10 @@ def main():
         print('无符合条件的标的')
         return
 
+    # ---- 评分：固定标尺（0~100），raw_score 本身就是总分
+    if 'raw_score' in df.columns:
+        df['score'] = pd.to_numeric(df['raw_score'], errors='coerce').astype(float).round(2)
+
     # 市值/估值过滤（使用硬编码参数）
     if not skip_mktcap:
         rows = df.to_dict(orient='records')
@@ -711,8 +1024,6 @@ def main():
         if df.empty:
             print('市值/估值过滤后无标的（检查区间是否合理）')
             return
-
-    df = df.sort_values('range_pct').reset_index(drop=True)
 
     # 输出前将列名改为中文
     col_map = {
@@ -727,9 +1038,18 @@ def main():
         'vol_spike_5d': '当日放量',
         'pos_in_1y': '一年区间位置(%)',
         'last3_up': '近3天连续上涨',
-        'today_up_ge_3pct': '当日涨幅≥3%'
+        'today_up_ge_3pct': '当日涨幅≥3%',
+        'raw_score': '原始评分',
+        'score': '评分',
+        'score_reason': '打分原因',
     }
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+
+    # 排序：优先评分（高分靠前），再按振幅（低振幅靠前）
+    if '评分' in df.columns:
+        df = df.sort_values(['评分', '振幅(%)'], ascending=[False, True]).reset_index(drop=True)
+    else:
+        df = df.sort_values('振幅(%)').reset_index(drop=True)
 
     if not quiet_arg:
         pd.set_option('display.max_rows', None)
