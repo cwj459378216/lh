@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 from tqdm import tqdm
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
 
@@ -27,16 +27,16 @@ class BacktestConfig:
     vol_factor: float = sel.CFG.vol_factor
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
-    start_date: str = '20251221'
+    start_date: str = '20200101'
     end_date: str = '20260106'
     # 回测交易参数
-    initial_capital: float = 1000000.0          # 初始资金
-    buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
+    initial_capital: float = 40000.0          # 初始资金
+    buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_fixed_amount: float = 10000.0           # 固定金额买入时，每次使用的金额
 
     # ratio 买入策略附加约束：最多持有 N 只；每只目标仓位 = total_equity * per_position_ratio
-    ratio_max_positions: int = 5
-    ratio_per_position: float = 0.20
+    ratio_max_positions: int = 3
+    ratio_per_position: float = 0.33
 
     # 卖出成交价模式：
     # - 'close': 当天收盘价卖出
@@ -70,12 +70,15 @@ class BacktestConfig:
     close_open_positions_at_end: bool = True
 
     # ratio 模式：当日候选多于可买名额时的“优先级排序”配置
-    # 说明：列表从前到后为优先级（先按第1个字段，再按第2个字段...），默认先选“是否三连涨信号”。
+    # 说明：列表从前到后为优先级（先按第1个字段，再按第2个字段...）。
     # 可选字段（当前已支持）：
+    # - 'score'（评分，数值越大越优先；若缺失则退化为 raw_score，仍缺失则记为 0）
+    # - 'raw_score'（原始评分，数值越大越优先）
     # - 'last3_up'（是否三连涨信号，True 优先）
     # - 'limit_up_days_1y'（近一年涨停次数，数值越大越优先）
-    # ratio_candidate_priority = ['last3_up', 'limit_up_days_1y']
-    ratio_candidate_priority: list[str] = None
+    # 默认：优先选评分高的
+    # ratio_candidate_priority = ['score', 'last3_up', 'limit_up_days_1y']
+    ratio_candidate_priority: list[str] = field(default_factory=lambda: ['score'])
 
 CFG = BacktestConfig()
 
@@ -211,6 +214,7 @@ def _apply_candidate_priority(df_sel: pd.DataFrame, priority: list[str] | None) 
     """ratio 模式下，候选过多时的排序策略。
 
     priority: 字段名列表，按顺序作为排序 key。
+    - score/raw_score: 数值大优先
     - last3_up: True 优先
     - limit_up_days_1y: 大优先
     """
@@ -219,7 +223,8 @@ def _apply_candidate_priority(df_sel: pd.DataFrame, priority: list[str] | None) 
 
     pr = priority
     if pr is None:
-        pr = ['last3_up']
+        # 默认：先按评分从高到低
+        pr = ['score']
 
     df = df_sel.copy()
     sort_cols: list[str] = []
@@ -228,6 +233,26 @@ def _apply_candidate_priority(df_sel: pd.DataFrame, priority: list[str] | None) 
     for key in pr:
         k = (key or '').strip()
         if not k:
+            continue
+
+        if k in ('score', 'raw_score'):
+            # 兼容：优先用 score（0~100 固定标尺）；缺失则用 raw_score
+            if k == 'score':
+                if 'score' in df.columns:
+                    src = 'score'
+                elif 'raw_score' in df.columns:
+                    src = 'raw_score'
+                else:
+                    src = None
+            else:
+                src = 'raw_score' if 'raw_score' in df.columns else None
+
+            if src is None:
+                df['_pri_score'] = 0.0
+            else:
+                df['_pri_score'] = pd.to_numeric(df[src], errors='coerce').fillna(0.0)
+            sort_cols.append('_pri_score')
+            ascendings.append(False)
             continue
 
         if k == 'last3_up':
@@ -261,7 +286,7 @@ def _apply_candidate_priority(df_sel: pd.DataFrame, priority: list[str] | None) 
         df = df.sort_values(sort_cols, ascending=ascendings)
 
     # 清理临时列
-    for c in ['_pri_last3_up', '_pri_limitup']:
+    for c in ['_pri_score', '_pri_last3_up', '_pri_limitup']:
         if c in df.columns:
             df = df.drop(columns=[c])
 

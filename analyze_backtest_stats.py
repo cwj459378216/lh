@@ -1,6 +1,6 @@
 import pandas as pd
 
-path = r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260115_1419\买入明细.csv"
+path = r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260115_1656\买入明细.csv"
 
 df = pd.read_csv(path, encoding="utf-8-sig")
 
