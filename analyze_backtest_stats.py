@@ -1,6 +1,6 @@
 import pandas as pd
 
-path = r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260115_1656\买入明细.csv"
+path = r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260117_0405\买入明细.csv"
 
 df = pd.read_csv(path, encoding="utf-8-sig")
 
@@ -16,6 +16,16 @@ if "原始评分" in df.columns:
     df["原始评分"] = pd.to_numeric(df["原始评分"], errors="coerce")
 if "评分" in df.columns:
     df["评分"] = pd.to_numeric(df["评分"], errors="coerce")
+
+# 新增：信号日涨幅(%) 分段统计
+# 兼容没有该列的情况
+if "信号日涨幅(%)" in df.columns:
+    df["信号日涨幅(%)"] = pd.to_numeric(df["信号日涨幅(%)"], errors="coerce")
+
+# 新增：信号日放量倍数 分段统计
+# 兼容没有该列的情况
+if "信号日放量倍数" in df.columns:
+    df["信号日放量倍数"] = pd.to_numeric(df["信号日放量倍数"], errors="coerce")
 
 
 def win_rate(x):
@@ -167,6 +177,62 @@ if "评分" in df.columns:
           .reset_index(names="评分区间")
     )
 
+# 6) 信号日涨幅(%) 分段统计（按档位：<=3.99 ,4 ,5 ,6 ,7 ,8 ,9<）
+# 说明：用 [a,b) 左闭右开
+# - "<=3.99"：(-inf,4)（即 <4，包含 3.99 档位）
+# - "4"： [4,5)
+# - ...
+# - "9<"： [9,10)
+sig_ret_stat = None
+if "信号日涨幅(%)" in df.columns:
+    sig_ret_bins = pd.cut(
+        df["信号日涨幅(%)"],
+        bins=[-float("inf"), 4, 5, 6, 7, 8, 9, 10, float("inf")],
+        right=False,
+        labels=["<=3.99", "4", "5", "6", "7", "8", "9<", "10+"],
+    )
+    sig_ret_stat = (
+        df.groupby(sig_ret_bins, dropna=False, observed=False)
+          .agg(
+              样本数=("是否盈利", "count"),
+              胜率=("是否盈利", win_rate),
+              平均盈亏=("卖出盈亏", profit_mean),
+              累计盈亏=("卖出盈亏", profit_sum),
+          )
+          .reset_index(names="信号日涨幅档位(%)")
+    )
+
+# 7) 信号日放量倍数 分段统计（按档位：>=2,3,4,5,6,7,8,9,10<）
+# 说明：用 [a,b) 左闭右开
+# - "<=2"：(-inf,2)
+# - ">=2"：[2,3)
+# - ...
+# - "10<"：[9,10)
+# - "10+"：[10, +inf)
+vol_mult_stat = None
+if "信号日放量倍数" in df.columns:
+    vol_mult_bins = pd.cut(
+        df["信号日放量倍数"],
+        bins=[-float("inf"), 2, 3, 4, 5, 6, 7, 8, 9, 10, float("inf")],
+        right=False,
+        labels=["<=2", ">=2", "3", "4", "5", "6", "7", "8", "9", "10+"],
+    )
+    # 注：这里的标签含义为：
+    # - ">=2" 代表 [2,3)
+    # - "3"   代表 [3,4)
+    # - ...
+    # - "9"   代表 [9,10)（即你说的 10<）
+    vol_mult_stat = (
+        df.groupby(vol_mult_bins, dropna=False, observed=False)
+          .agg(
+              样本数=("是否盈利", "count"),
+              胜率=("是否盈利", win_rate),
+              平均盈亏=("卖出盈亏", profit_mean),
+              累计盈亏=("卖出盈亏", profit_sum),
+          )
+          .reset_index(names="信号日放量倍数档位")
+    )
+
 # 总体汇总（便于看整体赚多少）
 overall = pd.Series({
     "样本数": df["是否盈利"].notna().sum(),
@@ -200,3 +266,11 @@ if raw_score_bin_stat is not None:
 if score_bin_stat is not None:
     print("\n=== 评分分段统计（每10分一组） ===")
     print(score_bin_stat)
+
+if sig_ret_stat is not None:
+    print("\n=== 信号日涨幅(%) 分段统计（档位：<=3.99 ,4 ,5 ,6 ,7 ,8 ,9<） ===")
+    print(sig_ret_stat)
+
+if vol_mult_stat is not None:
+    print("\n=== 信号日放量倍数 分段统计（档位：>=2,3,4,5,6,7,8,9,10<） ===")
+    print(vol_mult_stat)

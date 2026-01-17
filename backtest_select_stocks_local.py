@@ -27,12 +27,17 @@ class BacktestConfig:
     vol_factor: float = sel.CFG.vol_factor
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
-    start_date: str = '20200101'
-    end_date: str = '20260106'
+    start_date: str = '20260101'
+    end_date: str = '20260116'
     # 回测交易参数
-    initial_capital: float = 40000.0          # 初始资金
-    buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
+    initial_capital: float = 1000000.0          # 初始资金
+    buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_fixed_amount: float = 10000.0           # 固定金额买入时，每次使用的金额
+
+    # 买入成交价模式：
+    # - 'signal_close': 信号日当日收盘价买入
+    # - 'next_open': 信号日下一交易日开盘价买入（原逻辑）
+    buy_price_mode: str = 'next_open'
 
     # ratio 买入策略附加约束：最多持有 N 只；每只目标仓位 = total_equity * per_position_ratio
     ratio_max_positions: int = 3
@@ -101,7 +106,7 @@ def _available_trading_days(data_dir: str) -> list[pd.Timestamp]:
 
 
 def _load_symbol_map(data_dir: str) -> dict:
-    """预加载所有标的的 trade_date、open、close，便于价格查询。"""
+    """预加载所有标的的 trade_date、open、close（以及 volume/pre_close），便于价格查询与信号指标计算。"""
     files = [fn for fn in os.listdir(data_dir) if fn.lower().endswith('.csv')]
     files.sort()
     out = {}
@@ -110,8 +115,8 @@ def _load_symbol_map(data_dir: str) -> dict:
         stem = os.path.splitext(fn)[0]
         df = sel.load_csv(os.path.join(data_dir, fn))
         if not df.empty:
-            # 增加对开盘价的预加载，后面用于第二天开盘买入
-            cols = [c for c in ['trade_date', 'open', 'close'] if c in df.columns]
+            # 预加载：open/close 用于成交价；pre_close 用于涨幅；volume 用于放量倍数
+            cols = [c for c in ['trade_date', 'open', 'close', 'pre_close', 'volume'] if c in df.columns]
             out[stem] = df[cols].copy()
         pbar.update(1)
     pbar.close()
@@ -126,6 +131,52 @@ def _get_close(symbol_df: pd.DataFrame, date: pd.Timestamp) -> float | None:
         return None
     val = float(row['close'].iloc[0])
     return val if val > 0 else None
+
+
+def _get_pre_close(symbol_df: pd.DataFrame, date: pd.Timestamp) -> float | None:
+    """严格口径：优先用行情列 pre_close；缺失则用上一交易日 close 兜底。"""
+    if symbol_df is None or symbol_df.empty:
+        return None
+
+    df = symbol_df.sort_values('trade_date')
+    idx = df.index[df['trade_date'] == date]
+    if len(idx) == 0:
+        return None
+
+    pos = df.index.get_loc(idx[0])
+    if isinstance(pos, slice):
+        pos = pos.start
+
+    row = df.iloc[pos]
+
+    # 优先 pre_close
+    if 'pre_close' in df.columns:
+        try:
+            v = float(row.get('pre_close') or 0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+
+    # 兜底：上一交易日 close
+    if pos - 1 >= 0:
+        try:
+            v = float(df.iloc[pos - 1].get('close') or 0)
+            if v > 0:
+                return v
+        except Exception:
+            pass
+
+    return None
+
+
+def _calc_pct_chg_from_market(symbol_df: pd.DataFrame, date: pd.Timestamp) -> float | None:
+    """用行情数据严格计算当日涨幅(%)： (close - pre_close) / pre_close * 100。"""
+    c = _get_close(symbol_df, date)
+    pc = _get_pre_close(symbol_df, date)
+    if c is None or pc is None or pc <= 0:
+        return None
+    return float((c - pc) / pc * 100.0)
 
 
 def _get_next_open(symbol_df: pd.DataFrame, date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
@@ -291,6 +342,65 @@ def _apply_candidate_priority(df_sel: pd.DataFrame, priority: list[str] | None) 
             df = df.drop(columns=[c])
 
     return df
+
+
+def _get_buy_price(cfg: BacktestConfig, symbol_df: pd.DataFrame, signal_date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
+    """根据配置决定买入成交价与成交日。
+
+    - cfg.buy_price_mode == 'signal_close': 使用 signal_date 当天收盘价成交
+    - cfg.buy_price_mode == 'next_open': 使用 signal_date 的下一交易日开盘价成交
+
+    返回 (buy_date, buy_price)。若无法取到价格则返回 (None, None)。
+    """
+    mode = (getattr(cfg, 'buy_price_mode', None) or 'next_open').lower().strip()
+    if mode in ('signal_close', 'close'):
+        buy_price = _get_close(symbol_df, signal_date)
+        if buy_price is None or buy_price <= 0:
+            return None, None
+        return pd.to_datetime(signal_date), float(buy_price)
+
+    # 默认 next_open
+    return _get_next_open(symbol_df, signal_date)
+
+
+def _calc_vol_multiple(symbol_df: pd.DataFrame, date: pd.Timestamp) -> float | None:
+    """计算信号日成交量相对前一交易日的倍数：vol / prev_vol。
+
+    兼容列名：优先 'vol'，其次 'volume'。
+    若缺少数据或 prev_vol<=0，则返回 None。
+    """
+    if symbol_df is None or symbol_df.empty:
+        return None
+
+    vol_col = None
+    for c in ['vol', 'volume']:
+        if c in symbol_df.columns:
+            vol_col = c
+            break
+    if vol_col is None:
+        return None
+
+    df = symbol_df.sort_values('trade_date')
+    idx = df.index[df['trade_date'] == date]
+    if len(idx) == 0:
+        return None
+
+    pos = df.index.get_loc(idx[0])
+    if isinstance(pos, slice):
+        pos = pos.start
+
+    if pos - 1 < 0:
+        return None
+
+    try:
+        v_today = float(df.iloc[pos].get(vol_col) or 0)
+        v_prev = float(df.iloc[pos - 1].get(vol_col) or 0)
+    except Exception:
+        return None
+
+    if v_today <= 0 or v_prev <= 0:
+        return None
+    return float(v_today / v_prev)
 
 
 def main():
@@ -468,9 +578,10 @@ def main():
                             continue
 
                     sym_df = price_map.get(sym)
-                    # 使用下一交易日开盘价作为买入价
-                    buy_date, open_price = _get_next_open(sym_df, d)
-                    if buy_date is None or open_price is None or open_price <= 0:
+
+                    # 买入成交：由 buy_price_mode 控制（信号日收盘 / 次日开盘）
+                    buy_date, buy_price = _get_buy_price(cfg, sym_df, d)
+                    if buy_date is None or buy_price is None or buy_price <= 0:
                         continue
 
                     # 根据买入模式计算本次使用资金
@@ -494,18 +605,18 @@ def main():
                     lot_size = 100
 
                     # 资金不足（或单笔金额设置太小）：连 1 手都买不起
-                    if buy_cash <= 0 or buy_cash < open_price * lot_size:
+                    if buy_cash <= 0 or buy_cash < buy_price * lot_size:
                         buy_skip_insufficient_cash += 1
                         continue
 
-                    shares = int(buy_cash // open_price)
+                    shares = int(buy_cash // buy_price)
                     shares = (shares // lot_size) * lot_size
 
                     if shares <= 0:
                         buy_skip_insufficient_cash += 1
                         continue
 
-                    cost = shares * open_price
+                    cost = shares * buy_price
                     buy_commission = _calc_commission(cfg, cost)
                     total_cost = cost + buy_commission
 
@@ -524,6 +635,14 @@ def main():
                     signal_raw_score = _row_get('raw_score', pd.NA)
                     signal_score_reason = _row_get('score_reason', pd.NA)
 
+                    # 新增：信号日涨幅（严格用行情数据 close/pre_close 计算）
+                    _pct = _calc_pct_chg_from_market(sym_df, d)
+                    signal_pct_chg = float(_pct) if _pct is not None else pd.NA
+
+                    # 新增：信号日放量倍数（相对前一交易日）
+                    _vm = _calc_vol_multiple(sym_df, d)
+                    signal_vol_multiple = float(_vm) if _vm is not None else pd.NA
+
                     # 兼容可能的列名：market_cap / float_market_cap / 流通市值
                     signal_float_mktcap = (
                         _row_get('float_market_cap', pd.NA)
@@ -532,8 +651,8 @@ def main():
 
                     positions[sym] = {
                         'shares': shares,
-                        'entry_price': open_price,
-                        'buy_date': buy_date,   # 成交日（下一交易日）
+                        'entry_price': buy_price,
+                        'buy_date': buy_date,   # 成交日（信号日）
                         'peak_close': None,
                         'entry_cost': float(buy_commission),
                         'signal_date': d,
@@ -545,13 +664,17 @@ def main():
                         # 新增：评分
                         'signal_raw_score': signal_raw_score,
                         'signal_score_reason': signal_score_reason,
+                        # 新增：信号日涨幅
+                        'signal_pct_chg': signal_pct_chg,
+                        # 新增：信号日放量倍数
+                        'signal_vol_multiple': signal_vol_multiple,
                     }
 
                     trade_log.append({
                         'date': buy_date.strftime('%Y-%m-%d'),
                         'symbol': sym,
                         'action': 'BUY',
-                        'price': open_price,
+                        'price': buy_price,
                         'shares': shares,
                         'pnl': 0.0,
                         'fees': round(buy_commission, 2),
@@ -562,6 +685,10 @@ def main():
                         'pos_in_1y': signal_pos_in_1y,
                         'last3_up': signal_last3_up,
                         'float_market_cap': signal_float_mktcap,
+                        # 新增：信号日涨幅
+                        'signal_pct_chg': signal_pct_chg,
+                        # 新增：信号日放量倍数
+                        'signal_vol_multiple': signal_vol_multiple,
                         # 新增：评分
                         'raw_score': signal_raw_score,
                         'score_reason': signal_score_reason,
@@ -840,21 +967,34 @@ def main():
                     'signal_date': '信号日期',
                 })
 
-                # 新增：前一日一年内位置(%)（信号日计算的 pos_in_1y 就是“前一日一年内位置(%)”的口径）
+                # 新增：信号日涨幅(%)
+                if 'signal_pct_chg' in df_buy_summary_out.columns and '信号日涨幅(%)' not in df_buy_summary_out.columns:
+                    df_buy_summary_out['信号日涨幅(%)'] = pd.to_numeric(df_buy_summary_out['signal_pct_chg'], errors='coerce').round(2)
+
+                # 新增：信号日放量是前一日的多少倍
+                if 'signal_vol_multiple' in df_buy_summary_out.columns and '信号日放量倍数' not in df_buy_summary_out.columns:
+                    df_buy_summary_out['信号日放量倍数'] = pd.to_numeric(df_buy_summary_out['signal_vol_multiple'], errors='coerce').round(2)
+
+                # 补回：前一日一年内位置(%) / 是否三连涨信号 / 流通市值（避免在 cols_cn 过滤时被“消失”）
+                # 口径：pos_in_1y = 选股时计算的“前一日一年内位置(%)”
                 if 'pos_in_1y' in df_buy_summary_out.columns and '前一日一年内位置(%)' not in df_buy_summary_out.columns:
                     df_buy_summary_out['前一日一年内位置(%)'] = pd.to_numeric(df_buy_summary_out['pos_in_1y'], errors='coerce').round(2)
 
-                # 新增：是否三连涨信号（由 last3_up 转换：True->是，False->否）
                 if 'last3_up' in df_buy_summary_out.columns and '是否三连涨信号' not in df_buy_summary_out.columns:
                     _v = df_buy_summary_out['last3_up']
                     _b = _v.fillna(False).astype(bool)
                     df_buy_summary_out['是否三连涨信号'] = _b.map(lambda x: '是' if bool(x) else '否')
+
+                if 'float_market_cap' in df_buy_summary_out.columns and '流通市值' not in df_buy_summary_out.columns:
+                    df_buy_summary_out['流通市值'] = pd.to_numeric(df_buy_summary_out['float_market_cap'], errors='coerce')
 
                 cols_cn = [
                     '代码', '序号', '信号日期',
                     '买入日期', '买入价格', '买入股数', '买入金额', '买入税费',
                     '卖出日期', '卖出价格', '卖出股数', '卖出盈亏', '卖出原因', '卖出税费',
                     '持仓天数', '是否盈利', '持仓天数异常',
+                    '信号日涨幅(%)',
+                    '信号日放量倍数',
                     '前一日一年内位置(%)', '是否三连涨信号', '流通市值',
                     # 新增：评分
                     '原始评分', '评分', '评分原因',

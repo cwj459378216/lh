@@ -43,14 +43,14 @@ class Config:
     # 新增：价格区间过滤（排除某些买入价区间）
     # exclude_price_ranges: list[tuple[float, float]] = ()
     # 例如 [(15,20),(25,30)] 表示排除 [15,20) 与 [25,30)
-    exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
-    # exclude_price_ranges: list[tuple[float, float]] = ()
+    # exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
+    exclude_price_ranges: list[tuple[float, float]] = ()
 
     # 新增：一年内位置过滤（排除某些位置区间，单位：%）
     # 例如 [(60, 1e9)] 表示排除 [60, +inf)
     # 例如 [(60, 70), (80, 90)] 表示排除 [60,70) 与 [80,90)
-    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
-    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
+    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
+    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
 
     # 估值过滤（PE-TTM）：估值上下限，None 表示不限制
     pe_min: float | None = None       # PE(TTM)下限，例如10.0
