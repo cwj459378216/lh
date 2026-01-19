@@ -8,6 +8,8 @@ from tqdm import tqdm
 import requests
 import json
 from dataclasses import dataclass
+from dataclasses import field
+from typing import List
 
 # python select_stocks_local.py --end-date 20260110
 # python select_stocks_local.py --end-date 20251013 --debug-symbol 600868.SH
@@ -24,6 +26,10 @@ class Config:
         f"selection_local_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
     )
     date_subdir: bool = True  # 是否按当天日期(YYYYMMDD)创建子文件夹保存输出
+
+    # 评分过滤（按原始评分 raw_score）：None 表示不启用
+    min_score: float | None = None  # 例如 70.0
+
     # 市值过滤（单位：元）：总市值区间与是否跳过过滤
     mktcap_min: float = 8e9   # 市值下限，默认80亿
     mktcap_max: float = 15e9  # 市值上限，默认150亿
@@ -43,14 +49,14 @@ class Config:
     # 新增：价格区间过滤（排除某些买入价区间）
     # exclude_price_ranges: list[tuple[float, float]] = ()
     # 例如 [(15,20),(25,30)] 表示排除 [15,20) 与 [25,30)
-    # exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
-    exclude_price_ranges: list[tuple[float, float]] = ()
+    exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
+    # exclude_price_ranges: list[tuple[float, float]] = ()
 
     # 新增：一年内位置过滤（排除某些位置区间，单位：%）
     # 例如 [(60, 1e9)] 表示排除 [60, +inf)
     # 例如 [(60, 70), (80, 90)] 表示排除 [60,70) 与 [80,90)
-    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
-    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
+    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
+    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
 
     # 估值过滤（PE-TTM）：估值上下限，None 表示不限制
     pe_min: float | None = None       # PE(TTM)下限，例如10.0
@@ -71,6 +77,37 @@ class Config:
     pos_1y_max_pct: float | None = None
     # 单股测试：仅扫描该股票文件名（如 "603598.SH"），None 表示不限制
     test_single_symbol: str | None = None
+
+    # 新增：信号日涨幅过滤（排除某些涨幅区间，单位：%）
+    # 例如 [(5.0, 6.0)] 表示排除信号日涨幅位于 [5.0, 6.0)
+    # exclude_sig_up_pct_ranges: list[tuple[float, float]] = field(default_factory=lambda: [(5.0, 6.0)])  # type: ignore[assignment]
+    exclude_sig_up_pct_ranges: list[tuple[float, float]] = field(default_factory=lambda: [()])  # type: ignore[assignment]
+
+    # 新增：信号日放量倍数过滤（排除某些放量倍数区间）
+    # 例如 [(2.0, 3.0)] 表示排除信号日放量倍数位于 [2.0, 3.0)
+    # exclude_sig_vol_ratio_ranges: list[tuple[float, float]] = field(default_factory=lambda: [(7.0, 9.0)])  # type: ignore[assignment]
+    exclude_sig_vol_ratio_ranges: list[tuple[float, float]] = field(default_factory=lambda: [()])  # type: ignore[assignment]
+
+    # --- 新增：评分权重配置（原为模块常量 W_*）
+    # 三项权重：股价段 / 一年位置段 / 三连涨信号
+    w_price: float = 0.23
+    w_pos: float = 0.23
+    w_sig: float = 0.08
+
+    # 新增两项权重：信号日涨幅档位 / 信号日放量倍数档位
+    w_sig_up_pct: float = 0.23
+    w_sig_vol_ratio: float = 0.23
+
+    # 类别内：胜率/均盈亏权重
+    w_win_in_cat: float = 0.7
+    w_pnl_in_cat: float = 0.3
+
+    def __post_init__(self):
+        # 保持兼容：若外部显式传入 None，则转为空列表
+        if self.exclude_sig_up_pct_ranges is None:
+            self.exclude_sig_up_pct_ranges = []
+        if self.exclude_sig_vol_ratio_ranges is None:
+            self.exclude_sig_vol_ratio_ranges = []
 
 CFG = Config()
 
@@ -132,6 +169,34 @@ SIG_STATS = {
     "是": {"win_rate": 0.443609, "avg_pnl": 15.681353},
 }
 
+# --- 新增：信号日涨幅(%) 分段统计
+# 档位：<=3.99, 4, 5, 6, 7, 8, 9<（保留 10+ 以防未来出现）
+SIG_UP_PCT_SEG_STATS = {
+    "<=3.99": {"win_rate": 0.489669, "avg_pnl": 86.430723},
+    "4": {"win_rate": 0.458716, "avg_pnl": 97.439266},
+    "5": {"win_rate": 0.413462, "avg_pnl": -30.966346},
+    "6": {"win_rate": 0.459459, "avg_pnl": 277.994324},
+    "7": {"win_rate": 0.625000, "avg_pnl": 78.337500},
+    "8": {"win_rate": 1.000000, "avg_pnl": 503.795000},
+    "9<": {"win_rate": None, "avg_pnl": None},
+    "10+": {"win_rate": None, "avg_pnl": None},
+}
+
+# --- 新增：信号日放量倍数 分段统计
+# 档位：>=2, 3, 4, 5, 6, 7, 8, 9, 10+（保留 <=2 以防未来出现）
+SIG_VOL_RATIO_SEG_STATS = {
+    "<=2": {"win_rate": None, "avg_pnl": None},
+    ">=2": {"win_rate": 0.449438, "avg_pnl": 101.329978},
+    "3": {"win_rate": 0.464912, "avg_pnl": 29.550307},
+    "4": {"win_rate": 0.566667, "avg_pnl": 123.392222},
+    "5": {"win_rate": 0.621622, "avg_pnl": 248.105405},
+    "6": {"win_rate": 0.571429, "avg_pnl": 25.779643},
+    "7": {"win_rate": 0.375000, "avg_pnl": -7.408125},
+    "8": {"win_rate": 0.000000, "avg_pnl": -246.790000},
+    "9": {"win_rate": 0.333333, "avg_pnl": 38.700000},
+    "10+": {"win_rate": 0.600000, "avg_pnl": 55.376000},
+}
+
 # 评分归一化：满分 100 分
 # - 方法：为每一类（股价段/一年位置段/三连涨信号）先算一个 0~100 的“类别分”，再按权重累加成总分（0~100）
 # - 总分是固定标尺（跨批次可比），不再对“本次选股结果”做 min-max
@@ -140,9 +205,13 @@ SCORE_MIN = 0.0
 SCORE_FLAT_DEFAULT = 50.0
 
 # 三项权重：股价段 / 一年位置段 / 三连涨信号
-W_PRICE = 0.4
-W_POS = 0.4
-W_SIG = 0.2
+W_PRICE = 0.23
+W_POS = 0.23
+W_SIG = 0.08
+
+# 新增两项权重：信号日涨幅档位 / 信号日放量倍数档位
+W_SIG_UP_PCT = 0.23
+W_SIG_VOL_RATIO = 0.23
 
 # 类别内：胜率/均盈亏权重
 W_WIN_IN_CAT = 0.7
@@ -212,10 +281,40 @@ def _stats_min_max(stats: dict) -> dict[str, tuple[float | None, float | None]]:
 _PRICE_MM = _stats_min_max(PRICE_SEG_STATS)
 _POS_MM = _stats_min_max(POS_SEG_STATS)
 _SIG_MM = _stats_min_max(SIG_STATS)
+# 新增：两类信号日统计 min/max
+_SIG_UP_PCT_MM = _stats_min_max(SIG_UP_PCT_SEG_STATS)
+_SIG_VOL_RATIO_MM = _stats_min_max(SIG_VOL_RATIO_SEG_STATS)
 
 
 def _score_category(win_rate: float | None, avg_pnl: float | None, mm: dict[str, tuple[float | None, float | None]], w_win: float = W_WIN_IN_CAT, w_pnl: float = W_PNL_IN_CAT) -> tuple[float, float, float]:
     """按某一类的统计表，把(胜率,均盈亏) -> (类别分, 胜率子分, 均盈亏子分)，全部 0~100。"""
+    wr_min, wr_max = mm.get('win_rate', (None, None))
+    pnl_min, pnl_max = mm.get('avg_pnl', (None, None))
+
+    win_score = _min_max_norm_value(win_rate, wr_min, wr_max, out_min=SCORE_MIN, out_max=SCORE_MAX, flat_default=SCORE_FLAT_DEFAULT)
+    pnl_score = _min_max_norm_value(avg_pnl, pnl_min, pnl_max, out_min=SCORE_MIN, out_max=SCORE_MAX, flat_default=SCORE_FLAT_DEFAULT)
+
+    cat_score = float(w_win) * float(win_score) + float(w_pnl) * float(pnl_score)
+    cat_score = max(SCORE_MIN, min(SCORE_MAX, cat_score))
+    return float(cat_score), float(win_score), float(pnl_score)
+
+
+def _score_category(
+    win_rate: float | None,
+    avg_pnl: float | None,
+    mm: dict[str, tuple[float | None, float | None]],
+    w_win: float | None = None,
+    w_pnl: float | None = None,
+) -> tuple[float, float, float]:
+    """按某一类的统计表，把(胜率,均盈亏) -> (类别分, 胜率子分, 均盈亏子分)，全部 0~100。
+
+    权重默认从 CFG 读取，确保批量/回测可复现。
+    """
+    if w_win is None:
+        w_win = float(getattr(CFG, 'w_win_in_cat', W_WIN_IN_CAT))
+    if w_pnl is None:
+        w_pnl = float(getattr(CFG, 'w_pnl_in_cat', W_PNL_IN_CAT))
+
     wr_min, wr_max = mm.get('win_rate', (None, None))
     pnl_min, pnl_max = mm.get('avg_pnl', (None, None))
 
@@ -279,29 +378,90 @@ def _pos_segment_pct(pos_pct: float | None) -> str | None:
     return "100+"
 
 
-def _norm_score_from_win_rate(win_rate: float | None, base: float = 0.5, scale: float = 100.0) -> float:
-    """把胜率映射成分数：0.5=0分，+/-0.1=+/-10分（可调）。"""
-    if win_rate is None or pd.isna(win_rate):
-        return 0.0
-    return float((float(win_rate) - base) * scale)
+def _sig_up_pct_segment(up_pct: float | None) -> str | None:
+    """信号日涨幅分段（单位：%）。"""
+    if up_pct is None or pd.isna(up_pct):
+        return None
+    v = float(up_pct)
+    # 注意：你的统计表档位是 <=3.99, 4, 5, 6, 7, 8, 9<
+    if v <= 3.99:
+        return "<=3.99"
+    if v < 4.999999:
+        return "4"
+    if v < 5.999999:
+        return "5"
+    if v < 6.999999:
+        return "6"
+    if v < 7.999999:
+        return "7"
+    if v < 8.999999:
+        return "8"
+    if v < 10.0:
+        return "9<"
+    return "10+"
 
 
-def _norm_score_from_avg_pnl(avg_pnl: float | None, scale: float = 10.0) -> float:
-    """把平均盈亏映射成分数：avg_pnl/scale（可调）。"""
-    if avg_pnl is None or pd.isna(avg_pnl):
-        return 0.0
-    try:
-        return float(float(avg_pnl) / float(scale))
-    except Exception:
-        return 0.0
+def _sig_vol_ratio_segment(vol_ratio: float | None) -> str | None:
+    """信号日放量倍数分段（volume_today / volume_yesterday）。"""
+    if vol_ratio is None or pd.isna(vol_ratio):
+        return None
+    v = float(vol_ratio)
+    # 统计表以 >=2 为入门；其后按整数档位
+    if v < 2.0:
+        return "<=2"
+    if v < 3.0:
+        return ">=2"
+    if v < 4.0:
+        return "3"
+    if v < 5.0:
+        return "4"
+    if v < 6.0:
+        return "5"
+    if v < 7.0:
+        return "6"
+    if v < 8.0:
+        return "7"
+    if v < 9.0:
+        return "8"
+    if v < 10.0:
+        return "9"
+    return "10+"
 
 
-def score_row_by_backtest_stats(last_close: float | None, pos_in_1y_pct: float | None, last3_up: bool | None) -> tuple[float, str]:
+def _today_up_pct_value(df: pd.DataFrame) -> float | None:
+    """返回当日涨幅（单位：%），计算口径：close_today vs close_yesterday。"""
+    if df is None or len(df) < 2 or 'close' not in df.columns:
+        return None
+    prev_close = float(df['close'].iloc[-2])
+    today_close = float(df['close'].iloc[-1])
+    if prev_close <= 0:
+        return None
+    return float((today_close - prev_close) / prev_close * 100.0)
+
+
+def _today_vol_ratio_value(df: pd.DataFrame) -> float | None:
+    """返回当日放量倍数：volume_today / volume_yesterday。"""
+    if df is None or len(df) < 2 or 'volume' not in df.columns:
+        return None
+    prev_vol = float(df['volume'].iloc[-2])
+    today_vol = float(df['volume'].iloc[-1])
+    if prev_vol <= 0:
+        return None
+    return float(today_vol / prev_vol)
+
+
+def score_row_by_backtest_stats(
+    last_close: float | None,
+    pos_in_1y_pct: float | None,
+    last3_up: bool | None,
+    sig_today_up_pct: float | None = None,
+    sig_today_vol_ratio: float | None = None,
+) -> tuple[float, str]:
     """根据回测统计表为单条选股结果打分。
 
     返回：
     - raw_score: 固定标尺总分（0~100，跨批次可比）
-    - reason: 可读原因（包含三项类别分及其子分）
+    - reason: 可读原因（包含各项类别分及其子分）
     """
     # 1) 股价区间
     price_seg = _price_segment(last_close)
@@ -321,15 +481,38 @@ def score_row_by_backtest_stats(last_close: float | None, pos_in_1y_pct: float |
     s_wr = sstat.get("win_rate")
     s_pnl = sstat.get("avg_pnl")
 
+    # 4) 新增：信号日涨幅档位
+    sig_up_seg = _sig_up_pct_segment(sig_today_up_pct)
+    upstat = SIG_UP_PCT_SEG_STATS.get(sig_up_seg or "", {})
+    u_wr = upstat.get("win_rate")
+    u_pnl = upstat.get("avg_pnl")
+
+    # 5) 新增：信号日放量倍数档位
+    sig_vol_seg = _sig_vol_ratio_segment(sig_today_vol_ratio)
+    vstat = SIG_VOL_RATIO_SEG_STATS.get(sig_vol_seg or "", {})
+    v_wr = vstat.get("win_rate")
+    v_pnl = vstat.get("avg_pnl")
+
     # --- 分项打分（每类内部先归一化到 0~100，再按权重累加成总分 0~100）
+    # 权重从 CFG 读取（总和应为 1.0），确保配置可落盘/可复现。
+    w_price = float(getattr(CFG, 'w_price', W_PRICE))
+    w_pos = float(getattr(CFG, 'w_pos', W_POS))
+    w_sig = float(getattr(CFG, 'w_sig', W_SIG))
+    w_up = float(getattr(CFG, 'w_sig_up_pct', W_SIG_UP_PCT))
+    w_vol = float(getattr(CFG, 'w_sig_vol_ratio', W_SIG_VOL_RATIO))
+
     score_price, score_price_win, score_price_pnl = _score_category(p_wr, p_pnl, _PRICE_MM)
     score_pos, score_pos_win, score_pos_pnl = _score_category(o_wr, o_pnl, _POS_MM)
     score_sig, score_sig_win, score_sig_pnl = _score_category(s_wr, s_pnl, _SIG_MM)
+    score_up, score_up_win, score_up_pnl = _score_category(u_wr, u_pnl, _SIG_UP_PCT_MM)
+    score_vol, score_vol_win, score_vol_pnl = _score_category(v_wr, v_pnl, _SIG_VOL_RATIO_MM)
 
     raw_score = (
-        float(W_PRICE) * float(score_price)
-        + float(W_POS) * float(score_pos)
-        + float(W_SIG) * float(score_sig)
+        w_price * float(score_price)
+        + w_pos * float(score_pos)
+        + w_sig * float(score_sig)
+        + w_up * float(score_up)
+        + w_vol * float(score_vol)
     )
     raw_score = max(SCORE_MIN, min(SCORE_MAX, float(raw_score)))
 
@@ -337,19 +520,30 @@ def score_row_by_backtest_stats(last_close: float | None, pos_in_1y_pct: float |
     reasons: list[str] = []
     reasons.append(
         f"股价区间={_format_seg_value(price_seg)}(胜率={('N/A' if p_wr is None else round(float(p_wr)*100,2))}%,均盈亏={('N/A' if p_pnl is None else round(float(p_pnl),2))})"
-        f"=> 类别分={score_price:.2f}(胜率分={score_price_win:.2f},盈亏分={score_price_pnl:.2f},权重={W_PRICE})"
+        f"=> 类别分={score_price:.2f}(胜率分={score_price_win:.2f},盈亏分={score_price_pnl:.2f},权重={w_price:.3f})"
     )
     reasons.append(
         f"一年位置={_format_seg_value(pos_seg)}(胜率={('N/A' if o_wr is None else round(float(o_wr)*100,2))}%,均盈亏={('N/A' if o_pnl is None else round(float(o_pnl),2))})"
-        f"=> 类别分={score_pos:.2f}(胜率分={score_pos_win:.2f},盈亏分={score_pos_pnl:.2f},权重={W_POS})"
+        f"=> 类别分={score_pos:.2f}(胜率分={score_pos_win:.2f},盈亏分={score_pos_pnl:.2f},权重={w_pos:.3f})"
     )
     reasons.append(
         f"三连涨信号={sig_key}(胜率={('N/A' if s_wr is None else round(float(s_wr)*100,2))}%,均盈亏={('N/A' if s_pnl is None else round(float(s_pnl),2))})"
-        f"=> 类别分={score_sig:.2f}(胜率分={score_sig_win:.2f},盈亏分={score_sig_pnl:.2f},权重={W_SIG})"
+        f"=> 类别分={score_sig:.2f}(胜率分={score_sig_win:.2f},盈亏分={score_sig_pnl:.2f},权重={w_sig:.3f})"
     )
-    reasons.append(f"总分={raw_score:.2f}（固定标尺0~100）")
 
-    return float(round(raw_score, 6)), "；".join(reasons)
+    up_val_str = 'N/A' if sig_today_up_pct is None or pd.isna(sig_today_up_pct) else f"{float(sig_today_up_pct):.2f}%"
+    reasons.append(
+        f"信号日涨幅={up_val_str},档位={_format_seg_value(sig_up_seg)}(胜率={('N/A' if u_wr is None else round(float(u_wr)*100,2))}%,均盈亏={('N/A' if u_pnl is None else round(float(u_pnl),2))})"
+        f"=> 类别分={score_up:.2f}(胜率分={score_up_win:.2f},盈亏分={score_up_pnl:.2f},权重={w_up:.2f})"
+    )
+
+    vol_val_str = 'N/A' if sig_today_vol_ratio is None or pd.isna(sig_today_vol_ratio) else f"{float(sig_today_vol_ratio):.2f}x"
+    reasons.append(
+        f"信号日放量倍数={vol_val_str},档位={_format_seg_value(sig_vol_seg)}(胜率={('N/A' if v_wr is None else round(float(v_wr)*100,2))}%,均盈亏={('N/A' if v_pnl is None else round(float(v_pnl),2))})"
+        f"=> 类别分={score_vol:.2f}(胜率分={score_vol_win:.2f},盈亏分={score_vol_pnl:.2f},权重={w_vol:.2f})"
+    )
+
+    return raw_score, reasons
 
 
 def load_csv(path: str) -> pd.DataFrame:
@@ -605,6 +799,50 @@ def scan_dir(data_dir: str,
         if today_close > 0:
             high_close_ok = (today_high - today_close) / today_close <= CFG.high_close_tol + 1e-4
 
+        # --- 新增：信号日涨幅/放量倍数过滤（必须在 passed 里使用前先定义）
+        # 说明：
+        # - end_date=e 时，“信号日”定义为 bars_3m 的最后一根K线（即 e 对应/之前的最后交易日）。
+        # - 若无法计算指标（数据不足、缺列、pre_close<=0 等），则不过滤（保持 True），避免误杀。
+        sig_today_up_pct = None
+        sig_today_vol_ratio = None
+        sig_up_ok = True
+        sig_vol_ok = True
+
+        try:
+            # 信号日涨幅(%)：用当日 close 与前一日 close 计算（与其它逻辑保持一致）
+            if bars_3m is not None and len(bars_3m) >= 2:
+                _pc = float(bars_3m['close'].iloc[-2])
+                _c = float(bars_3m['close'].iloc[-1])
+                if _pc > 0:
+                    sig_today_up_pct = (_c - _pc) / _pc * 100.0
+        except Exception:
+            sig_today_up_pct = None
+
+        try:
+            # 信号日放量倍数：今日 volume / 昨日 volume
+            if bars_3m is not None and len(bars_3m) >= 2 and 'volume' in bars_3m.columns:
+                _v0 = float(bars_3m['volume'].iloc[-2])
+                _v1 = float(bars_3m['volume'].iloc[-1])
+                if _v0 > 0 and _v1 > 0:
+                    sig_today_vol_ratio = _v1 / _v0
+        except Exception:
+            sig_today_vol_ratio = None
+
+        # 应用排除区间：只有当指标可计算时才生效
+        try:
+            _ranges = list(getattr(CFG, 'exclude_sig_up_pct_ranges', []) or [])
+            if sig_today_up_pct is not None and (not pd.isna(sig_today_up_pct)) and _ranges:
+                sig_up_ok = not _in_any_range(float(sig_today_up_pct), _ranges)
+        except Exception:
+            sig_up_ok = True
+
+        try:
+            _ranges = list(getattr(CFG, 'exclude_sig_vol_ratio_ranges', []) or [])
+            if sig_today_vol_ratio is not None and (not pd.isna(sig_today_vol_ratio)) and _ranges:
+                sig_vol_ok = not _in_any_range(float(sig_today_vol_ratio), _ranges)
+        except Exception:
+            sig_vol_ok = True
+
         # 计算今年区间内位置（按近一年窗口 bars_all）
         pos_pct = None
         if not bars_all.empty:
@@ -666,6 +904,8 @@ def scan_dir(data_dir: str,
             and pos_ok
             and price_ok
             and pos_exclude_ok
+            and sig_up_ok
+            and sig_vol_ok
         )
 
         # 新增：指定 debug_symbol 时，即使未通过也输出原因（配合 --end-date 用来看某天为什么没触发）
@@ -814,7 +1054,9 @@ def scan_dir(data_dir: str,
                     f"启动质量(涨+量+收盘≥中轴)={start_quality}; "
                     f"附加条件整体={extra_cond}; "
                     f"价格过滤(排除{list(CFG.exclude_price_ranges)})={price_ok}; "
-                    f"一年内位置过滤(排除{list(CFG.exclude_pos_1y_ranges_pct)})={pos_exclude_ok}"
+                    f"一年内位置过滤(排除{list(CFG.exclude_pos_1y_ranges_pct)})={pos_exclude_ok}; "
+                    f"信号日涨幅过滤(排除{list(CFG.exclude_sig_up_pct_ranges)})={sig_up_ok}; "
+                    f"信号日放量倍数过滤(排除{list(CFG.exclude_sig_vol_ratio_ranges)})={sig_vol_ok}"
                 )
             except Exception:
                 pass
@@ -824,6 +1066,8 @@ def scan_dir(data_dir: str,
                 last_close=last_close,
                 pos_in_1y_pct=(pos_pct * 100.0 if isinstance(pos_pct, float) else None),
                 last3_up=_is_last_n_days_all_up(bars_all, CFG.last_n_days_red_n),
+                sig_today_up_pct=sig_today_up_pct,
+                sig_today_vol_ratio=sig_today_vol_ratio,
             )
 
             results.append({
@@ -834,14 +1078,17 @@ def scan_dir(data_dir: str,
                 'low': round(low, 3),
                 'last_close': round(last_close, 3),
                 'range_pct': round(rng * 100, 2),
-                'limit_up_days_1y': int(limitup_cnt),
+                'limit_up_days_1y': '近一年涨停天数',
                 'vol_spike_5d': bool(vol_spike),
                 'pos_in_1y': (round(pos_pct * 100, 2) if isinstance(pos_pct, float) else None),
                 'last3_up': _is_last_n_days_all_up(bars_all, CFG.last_n_days_red_n),
                 'today_up_ge_3pct': _is_today_up_pct(bars_all, CFG.up_pct_threshold),
+                # 新增：信号日涨幅与放量倍数（用于评分与输出）
+                'sig_today_up_pct': (round(float(sig_today_up_pct), 4) if sig_today_up_pct is not None and not pd.isna(sig_today_up_pct) else None),
+                'sig_today_vol_ratio': (round(float(sig_today_vol_ratio), 4) if sig_today_vol_ratio is not None and not pd.isna(sig_today_vol_ratio) else None),
                 # 可选：输出启动质量标志
                 'start_quality': bool(start_quality),
-                # 新增：评分（原始得分，后续会归一化成 0~100）
+                # 评分
                 'raw_score': _raw_score,
                 'score_reason': _reason,
             })
@@ -941,6 +1188,9 @@ def main():
     data_dir = CFG.data_dir
     out_path = CFG.default_out
 
+    # 评分过滤阈值（按原始评分 raw_score 过滤；None 表示不启用）
+    min_score_arg = CFG.min_score
+
     # 可选命令行参数：指定截止日期与静默模式
     end_date_arg = None
     quiet_arg = False
@@ -1014,8 +1264,23 @@ def main():
         return
 
     # ---- 评分：固定标尺（0~100），raw_score 本身就是总分
+    # 为保持与 backtest_select_stocks_local 一致：这里也做一次数值化 + 归一化(0~100)
     if 'raw_score' in df.columns:
-        df['score'] = pd.to_numeric(df['raw_score'], errors='coerce').astype(float).round(2)
+        df['_raw_score_num'] = pd.to_numeric(df['raw_score'], errors='coerce')
+        df['score'] = _min_max_normalize(df['_raw_score_num'], vmin=0.0, vmax=100.0, flat_default=50.0).round(2)
+        df = df.drop(columns=['_raw_score_num'])
+
+    # 评分过滤（按原始评分 raw_score）
+    if min_score_arg is not None:
+        if 'raw_score' in df.columns:
+            df = df[pd.to_numeric(df['raw_score'], errors='coerce') >= float(min_score_arg)].copy()
+        else:
+            # 若无 raw_score 列则无法按评分过滤
+            if not quiet_arg:
+                print('未生成 raw_score 列，跳过评分过滤（min_score_arg 已设置但未产生 raw_score）')
+        if df.empty:
+            print(f'评分过滤后无标的（min_score={min_score_arg}）')
+            return
 
     # 市值/估值过滤（使用硬编码参数）
     if not skip_mktcap:
@@ -1027,9 +1292,11 @@ def main():
             return
 
     # 输出前将列名改为中文
+   
     col_map = {
         'symbol': '标的',
         'code': '代码',
+       
         'market': '市场',
         'high': '最高价',
         'low': '最低价',
@@ -1043,6 +1310,9 @@ def main():
         'raw_score': '原始评分',
         'score': '评分',
         'score_reason': '打分原因',
+        # 新增输出字段
+        'sig_today_up_pct': '信号日涨幅(%)',
+        'sig_today_vol_ratio': '信号日放量倍数',
     }
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 

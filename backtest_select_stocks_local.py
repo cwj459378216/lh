@@ -31,7 +31,7 @@ class BacktestConfig:
     end_date: str = '20260116'
     # 回测交易参数
     initial_capital: float = 1000000.0          # 初始资金
-    buy_mode: str = 'fixed'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
+    buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
     buy_fixed_amount: float = 10000.0           # 固定金额买入时，每次使用的金额
 
     # 买入成交价模式：
@@ -83,25 +83,42 @@ class BacktestConfig:
     # - 'limit_up_days_1y'（近一年涨停次数，数值越大越优先）
     # 默认：优先选评分高的
     # ratio_candidate_priority = ['score', 'last3_up', 'limit_up_days_1y']
-    ratio_candidate_priority: list[str] = field(default_factory=lambda: ['score'])
+    ratio_candidate_priority: list[str] = field(default_factory=lambda: ['raw_score'])
 
 CFG = BacktestConfig()
 
 
 def _available_trading_days(data_dir: str) -> list[pd.Timestamp]:
-    # 根据任意一个CSV汇总交易日（取并集）
+    """根据任意一个CSV汇总交易日（取并集）。
+
+    兼容：
+    - trade_date 既可能是 'YYYYMMDD' 也可能是 'YYYY-MM-DD'
+    - 可能存在无法解析的日期/空值
+
+    返回值统一为 *normalize()* 过的日期（00:00:00），便于与 start/end 做区间比较。
+    """
     files = [fn for fn in os.listdir(data_dir) if fn.lower().endswith('.csv')]
     files.sort()
-    dates = set()
+    dates: set[pd.Timestamp] = set()
+
     pbar = tqdm(total=len(files), desc='扫描交易日', dynamic_ncols=True)
     for fn in files:
         fp = os.path.join(data_dir, fn)
         df = sel.load_csv(fp)
-        if not df.empty and 'trade_date' in df.columns:
-            for d in df['trade_date']:
-                dates.add(pd.to_datetime(d))
+        if df is None or df.empty or 'trade_date' not in df.columns:
+            pbar.update(1)
+            continue
+
+        # 统一解析为 Timestamp；无法解析的会变成 NaT
+        s = pd.to_datetime(df['trade_date'], errors='coerce')
+        # 过滤 NaT，并 normalize
+        s = s.dropna().dt.normalize()
+        for d in s.tolist():
+            dates.add(pd.to_datetime(d).normalize())
+
         pbar.update(1)
     pbar.close()
+
     return sorted(dates)
 
 
@@ -422,15 +439,54 @@ def main():
             early_exit_step_min_return=getattr(cfg, 'early_exit_step_min_return', 0.03),
         )
 
-        start = pd.to_datetime(cfg.start_date)
-        end = pd.to_datetime(cfg.end_date)
+        def _parse_yyyymmdd(x) -> pd.Timestamp:
+            """兼容解析：
+            - '20260101' / 20260101 -> 当作 YYYYMMDD
+            - '2026-01-01' / Timestamp -> 交给 pandas
+
+            背景：pandas 对纯数字 int 有时会按“纳秒时间戳”解释，导致落到 1970-01-01。
+            """
+            if x is None:
+                raise ValueError('date is None')
+            # 先把纯数字统一成字符串
+            if isinstance(x, (int, float)) and not pd.isna(x):
+                x = str(int(x))
+            s = str(x).strip()
+            if s.isdigit() and len(s) == 8:
+                return pd.to_datetime(s, format='%Y%m%d')
+            return pd.to_datetime(s, errors='raise')
+
+        start = _parse_yyyymmdd(cfg.start_date).normalize()
+        end = _parse_yyyymmdd(cfg.end_date).normalize()
 
         print('扫描交易日...')
-        all_days = _available_trading_days(cfg.data_dir)
+        all_days = [pd.to_datetime(d, errors='coerce').normalize() for d in _available_trading_days(cfg.data_dir)]
+        all_days = [d for d in all_days if pd.notna(d)]
         test_days = [d for d in all_days if start <= d <= end]
         if not test_days:
             print('指定区间内无交易日')
-            return
+            # 仍然返回本次输出目录，并写一个说明文件，方便批量任务留痕
+            try:
+                mind = min(all_days) if all_days else None
+                maxd = max(all_days) if all_days else None
+                head_days = [d.strftime('%Y-%m-%d') for d in all_days[:10]]
+                tail_days = [d.strftime('%Y-%m-%d') for d in all_days[-10:]]
+                pd.DataFrame([
+                    {'项': '状态', '值': '无交易日'},
+                    {'项': 'start_date', '值': cfg.start_date},
+                    {'项': 'end_date', '值': cfg.end_date},
+                    {'项': 'start(parsed)', '值': str(start)},
+                    {'项': 'end(parsed)', '值': str(end)},
+                    {'项': 'data_dir', '值': cfg.data_dir},
+                    {'项': 'all_days_count', '值': len(all_days)},
+                    {'项': 'all_days_min', '值': str(mind) if mind is not None else ''},
+                    {'项': 'all_days_max', '值': str(maxd) if maxd is not None else ''},
+                    {'项': 'all_days_head10', '值': ','.join(head_days)},
+                    {'项': 'all_days_tail10', '值': ','.join(tail_days)},
+                ]).to_csv(os.path.join(run_out_dir, '回测未运行原因.csv'), index=False, encoding='utf-8-sig')
+            except Exception:
+                pass
+            return run_out_dir
 
         # 交易账户状态
         cash = cfg.initial_capital
@@ -551,148 +607,152 @@ def main():
 
             # 买入：对当日选股，若未持有，则按配置的买入模式买入（按下一交易日开盘价成交）
             if not df_sel.empty:
-                # ratio 模式：若当日候选太多，按配置的优先级排序，并只取剩余名额
-                if (cfg.buy_mode or '').lower().strip() == 'ratio':
-                    remaining_slots = int(cfg.ratio_max_positions) - len(positions)
-                    if remaining_slots <= 0:
-                        df_sel = df_sel.iloc[0:0]
-                    else:
-                        # 默认优先级：last3_up（是否三连涨信号）
-                        pri = getattr(cfg, 'ratio_candidate_priority', None)
-                        if pri is None:
-                            pri = ['last3_up']
-                        df_sel = _apply_candidate_priority(df_sel, pri)
-
-                        # 候选超过名额：只取前 N 个
-                        if len(df_sel) > remaining_slots:
-                            df_sel = df_sel.head(remaining_slots).copy()
-
-                for _, row in df_sel.iterrows():
-                    sym = row['symbol']
-                    if sym in positions:
-                        continue
-
-                    # ratio 策略：最多持有 N 只
+                if df_sel.empty:
+                    # 当日候选全部被过滤
+                    pass
+                else:
+                    # ratio 模式：若当日候选太多，按配置的优先级排序，并只取剩余名额
                     if (cfg.buy_mode or '').lower().strip() == 'ratio':
-                        if len(positions) >= int(cfg.ratio_max_positions):
+                        remaining_slots = int(cfg.ratio_max_positions) - len(positions)
+                        if remaining_slots <= 0:
+                            df_sel = df_sel.iloc[0:0]
+                        else:
+                            # 默认优先级：last3_up（是否三连涨信号）
+                            pri = getattr(cfg, 'ratio_candidate_priority', None)
+                            if pri is None:
+                                pri = ['last3_up']
+                            df_sel = _apply_candidate_priority(df_sel, pri)
+
+                            # 候选超过名额：只取前 N 个
+                            if len(df_sel) > remaining_slots:
+                                df_sel = df_sel.head(remaining_slots).copy()
+
+                    for _, row in df_sel.iterrows():
+                        sym = row['symbol']
+                        if sym in positions:
                             continue
 
-                    sym_df = price_map.get(sym)
+                        # ratio 策略：最多持有 N 只
+                        if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                            if len(positions) >= int(cfg.ratio_max_positions):
+                                continue
 
-                    # 买入成交：由 buy_price_mode 控制（信号日收盘 / 次日开盘）
-                    buy_date, buy_price = _get_buy_price(cfg, sym_df, d)
-                    if buy_date is None or buy_price is None or buy_price <= 0:
-                        continue
+                        sym_df = price_map.get(sym)
 
-                    # 根据买入模式计算本次使用资金
-                    if (cfg.buy_mode or '').lower().strip() == 'ratio':
-                        # 每个票占 20% 总权益（按信号日收盘估值的 total_equity；再受限于可用现金）
-                        total_equity = cash
-                        for _sym, _pos in positions.items():
-                            _sym_df = price_map.get(_sym)
-                            _close = _get_close(_sym_df, d)
-                            if _close is None:
-                                _close = float(_pos.get('peak_close') or _pos['entry_price'])
-                            total_equity += _pos['shares'] * _close
+                        # 买入成交：由 buy_price_mode 控制（信号日收盘 / 次日开盘）
+                        buy_date, buy_price = _get_buy_price(cfg, sym_df, d)
+                        if buy_date is None or buy_price is None or buy_price <= 0:
+                            continue
 
-                        buy_cash = float(total_equity) * float(cfg.ratio_per_position)
-                    else:
-                        buy_cash = cfg.buy_fixed_amount
+                        # 根据买入模式计算本次使用资金
+                        if (cfg.buy_mode or '').lower().strip() == 'ratio':
+                            # 每个票占 20% 总权益（按信号日收盘估值的 total_equity；再受限于可用现金）
+                            total_equity = cash
+                            for _sym, _pos in positions.items():
+                                _sym_df = price_map.get(_sym)
+                                _close = _get_close(_sym_df, d)
+                                if _close is None:
+                                    _close = float(_pos.get('peak_close') or _pos['entry_price'])
+                                total_equity += _pos['shares'] * _close
 
-                    buy_cash = min(buy_cash, cash)
+                            buy_cash = float(total_equity) * float(cfg.ratio_per_position)
+                        else:
+                            buy_cash = cfg.buy_fixed_amount
 
-                    # 固定金额模式：按100股一手取整买入（向下取整到100的整数倍）
-                    lot_size = 100
+                        buy_cash = min(buy_cash, cash)
 
-                    # 资金不足（或单笔金额设置太小）：连 1 手都买不起
-                    if buy_cash <= 0 or buy_cash < buy_price * lot_size:
-                        buy_skip_insufficient_cash += 1
-                        continue
+                        # 固定金额模式：按100股一手取整买入（向下取整到100的整数倍）
+                        lot_size = 100
 
-                    shares = int(buy_cash // buy_price)
-                    shares = (shares // lot_size) * lot_size
+                        # 资金不足（或单笔金额设置太小）：连 1 手都买不起
+                        if buy_cash <= 0 or buy_cash < buy_price * lot_size:
+                            buy_skip_insufficient_cash += 1
+                            continue
 
-                    if shares <= 0:
-                        buy_skip_insufficient_cash += 1
-                        continue
+                        shares = int(buy_cash // buy_price)
+                        shares = (shares // lot_size) * lot_size
 
-                    cost = shares * buy_price
-                    buy_commission = _calc_commission(cfg, cost)
-                    total_cost = cost + buy_commission
+                        if shares <= 0:
+                            buy_skip_insufficient_cash += 1
+                            continue
 
-                    # 由于佣金包含最低值，total_cost 可能略高于 buy_cash/cash，再次校验
-                    if total_cost > cash:
-                        buy_skip_insufficient_cash += 1
-                        continue
+                        cost = shares * buy_price
+                        buy_commission = _calc_commission(cfg, cost)
+                        total_cost = cost + buy_commission
 
-                    cash -= total_cost
+                        # 由于佣金包含最低值，total_cost 可能略高于 buy_cash/cash，再次校验
+                        if total_cost > cash:
+                            buy_skip_insufficient_cash += 1
+                            continue
 
-                    # 保存信号日的关键指标（用于买入汇总，不改变交易逻辑）
-                    _row_get = (row.get if hasattr(row, 'get') else (lambda k, default=None: row[k] if k in row else default))
-                    signal_pos_in_1y = _row_get('pos_in_1y', pd.NA)
-                    signal_last3_up = _row_get('last3_up', pd.NA)
-                    # 新增：评分信息（来自选股结果；选股侧已产出 raw_score/score_reason，score(0-100) 需在回测侧汇总后归一化）
-                    signal_raw_score = _row_get('raw_score', pd.NA)
-                    signal_score_reason = _row_get('score_reason', pd.NA)
+                        cash -= total_cost
 
-                    # 新增：信号日涨幅（严格用行情数据 close/pre_close 计算）
-                    _pct = _calc_pct_chg_from_market(sym_df, d)
-                    signal_pct_chg = float(_pct) if _pct is not None else pd.NA
+                        # 保存信号日的关键指标（用于买入汇总，不改变交易逻辑）
+                        _row_get = (row.get if hasattr(row, 'get') else (lambda k, default=None: row[k] if k in row else default))
+                        signal_pos_in_1y = _row_get('pos_in_1y', pd.NA)
+                        signal_last3_up = _row_get('last3_up', pd.NA)
+                        # 新增：评分信息（来自选股结果；选股侧已产出 raw_score/score_reason，score(0-100) 需在回测侧汇总后归一化）
+                        signal_raw_score = _row_get('raw_score', pd.NA)
+                        signal_score_reason = _row_get('score_reason', pd.NA)
 
-                    # 新增：信号日放量倍数（相对前一交易日）
-                    _vm = _calc_vol_multiple(sym_df, d)
-                    signal_vol_multiple = float(_vm) if _vm is not None else pd.NA
+                        # 新增：信号日涨幅（严格用行情数据 close/pre_close 计算）
+                        _pct = _calc_pct_chg_from_market(sym_df, d)
+                        signal_pct_chg = float(_pct) if _pct is not None else pd.NA
 
-                    # 兼容可能的列名：market_cap / float_market_cap / 流通市值
-                    signal_float_mktcap = (
-                        _row_get('float_market_cap', pd.NA)
-                        if _row_get('float_market_cap', None) is not None else _row_get('market_cap', pd.NA)
-                    )
+                        # 新增：信号日放量倍数（相对前一交易日）
+                        _vm = _calc_vol_multiple(sym_df, d)
+                        signal_vol_multiple = float(_vm) if _vm is not None else pd.NA
 
-                    positions[sym] = {
-                        'shares': shares,
-                        'entry_price': buy_price,
-                        'buy_date': buy_date,   # 成交日（信号日）
-                        'peak_close': None,
-                        'entry_cost': float(buy_commission),
-                        'signal_date': d,
-                        'signal_open': None,
-                        # signal-day metrics for later summary
-                        'signal_pos_in_1y': signal_pos_in_1y,
-                        'signal_last3_up': signal_last3_up,
-                        'signal_float_mktcap': signal_float_mktcap,
-                        # 新增：评分
-                        'signal_raw_score': signal_raw_score,
-                        'signal_score_reason': signal_score_reason,
-                        # 新增：信号日涨幅
-                        'signal_pct_chg': signal_pct_chg,
-                        # 新增：信号日放量倍数
-                        'signal_vol_multiple': signal_vol_multiple,
-                    }
+                        # 兼容可能的列名：market_cap / float_market_cap / 流通市值
+                        signal_float_mktcap = (
+                            _row_get('float_market_cap', pd.NA)
+                            if _row_get('float_market_cap', None) is not None else _row_get('market_cap', pd.NA)
+                        )
 
-                    trade_log.append({
-                        'date': buy_date.strftime('%Y-%m-%d'),
-                        'symbol': sym,
-                        'action': 'BUY',
-                        'price': buy_price,
-                        'shares': shares,
-                        'pnl': 0.0,
-                        'fees': round(buy_commission, 2),
-                        # 记录“下单日（信号日）”及当日指标，供后续买入汇总直接使用
-                        'signal_date': d.strftime('%Y-%m-%d'),
-                        'pos_1y_min_pct': (_row_get('pos_1y_min_pct', pd.NA)),
-                        'pos_1y_max_pct': (_row_get('pos_1y_max_pct', pd.NA)),
-                        'pos_in_1y': signal_pos_in_1y,
-                        'last3_up': signal_last3_up,
-                        'float_market_cap': signal_float_mktcap,
-                        # 新增：信号日涨幅
-                        'signal_pct_chg': signal_pct_chg,
-                        # 新增：信号日放量倍数
-                        'signal_vol_multiple': signal_vol_multiple,
-                        # 新增：评分
-                        'raw_score': signal_raw_score,
-                        'score_reason': signal_score_reason,
-                    })
+                        positions[sym] = {
+                            'shares': shares,
+                            'entry_price': buy_price,
+                            'buy_date': buy_date,   # 成交日（信号日）
+                            'peak_close': None,
+                            'entry_cost': float(buy_commission),
+                            'signal_date': d,
+                            'signal_open': None,
+                            # signal-day metrics for later summary
+                            'signal_pos_in_1y': signal_pos_in_1y,
+                            'signal_last3_up': signal_last3_up,
+                            'signal_float_mktcap': signal_float_mktcap,
+                            # 新增：评分
+                            'signal_raw_score': signal_raw_score,
+                            'signal_score_reason': signal_score_reason,
+                            # 新增：信号日涨幅
+                            'signal_pct_chg': signal_pct_chg,
+                            # 新增：信号日放量倍数
+                            'signal_vol_multiple': signal_vol_multiple,
+                        }
+
+                        trade_log.append({
+                            'date': buy_date.strftime('%Y-%m-%d'),
+                            'symbol': sym,
+                            'action': 'BUY',
+                            'price': buy_price,
+                            'shares': shares,
+                            'pnl': 0.0,
+                            'fees': round(buy_commission, 2),
+                            # 记录“下单日（信号日）”及当日指标，供后续买入汇总直接使用
+                            'signal_date': d.strftime('%Y-%m-%d'),
+                            'pos_1y_min_pct': (_row_get('pos_1y_min_pct', pd.NA)),
+                            'pos_1y_max_pct': (_row_get('pos_1y_max_pct', pd.NA)),
+                            'pos_in_1y': signal_pos_in_1y,
+                            'last3_up': signal_last3_up,
+                            'float_market_cap': signal_float_mktcap,
+                            # 新增：信号日涨幅
+                            'signal_pct_chg': signal_pct_chg,
+                            # 新增：信号日放量倍数
+                            'signal_vol_multiple': signal_vol_multiple,
+                            # 新增：评分
+                            'raw_score': signal_raw_score,
+                            'score_reason': signal_score_reason,
+                        })
 
             # 计算当日权益（持仓按收盘价估值）
             equity = cash
@@ -1073,6 +1133,40 @@ def main():
         if summary_rows:
             df_summary = pd.DataFrame(summary_rows)
             df_summary.to_csv(os.path.join(run_out_dir, '回测统计.csv'), index=False, encoding='utf-8-sig')
+
+        # 新增：输出本次回测运行的全部配置（不影响原有输出文件）
+        try:
+            cfg_rows = []
+
+            def _append_cfg(module_name: str, cfg_obj):
+                _d = cfg_obj.__dict__.copy() if (cfg_obj is not None and hasattr(cfg_obj, '__dict__')) else {}
+                for _k in sorted(_d.keys()):
+                    _v = _d.get(_k)
+                    if isinstance(_v, (list, dict, tuple, set)):
+                        _v_out = str(_v)
+                    else:
+                        _v_out = _v
+                    cfg_rows.append({'模块': module_name, '参数': _k, '值': _v_out})
+
+            # 1) 回测配置（BacktestConfig / cfg）
+            _append_cfg('backtest_select_stocks_local', cfg)
+
+            # 2) 选股脚本配置（select_stocks_local / sel.CFG）
+            try:
+                _append_cfg('select_stocks_local', getattr(sel, 'CFG', None))
+            except Exception as _e2:
+                cfg_rows.append({'模块': 'select_stocks_local', '参数': '__error__', '值': repr(_e2)})
+
+            # 3) 止损规则配置（stop_loss_rules / StopLossConfig / sl_cfg）
+            try:
+                _append_cfg('stop_loss_rules', sl_cfg)
+            except Exception as _e3:
+                cfg_rows.append({'模块': 'stop_loss_rules', '参数': '__error__', '值': repr(_e3)})
+
+            df_cfg = pd.DataFrame(cfg_rows)
+            df_cfg.to_csv(os.path.join(run_out_dir, '回测配置.csv'), index=False, encoding='utf-8-sig')
+        except Exception as _e:
+            print('写出回测配置文件失败：', repr(_e))
 
         return run_out_dir
     except Exception as e:
