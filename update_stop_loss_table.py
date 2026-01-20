@@ -1,23 +1,22 @@
 """update_stop_loss_table.py
 
-根据 `wh/止损表.csv` 中的【购买时间、代码】读取本地日线数据，
-结合 `stop_loss_rules.py` 中的止损策略，计算并回写以下字段：
+功能：
+1) 止损表模式（旧）：
+     根据输入 CSV 的【购买时间、代码】读取本地日线数据，结合 `stop_loss_rules.py` 计算并回写：
+     - 收盘最高价、止损价格、持仓时间、是否平仓、平仓日期、平仓原因
 
-- 收盘最高价: 从买入日(含)到当前评估日(含)的最大收盘价
-- 止损价格: 收盘最高价 * (1 - 回撤止损比例)
-- 持仓时间: 从买入日到当前评估日的自然日天数（end_date - buy_date）
-- 是否平仓: 是否在区间内触发止损/规则并在触发日记为平仓
-
-用法（PowerShell 示例）：
-  python update_stop_loss_table.py --end-date 20260106
+2) 买入明细模式（新增/自动识别）：
+     读取 backtest 输出的 `买入明细.csv`，若某行未填写【卖出日期/卖出价格/卖出原因】则：
+     - 按 `stop_loss_rules.evaluate_exit_signal` 逐日评估到 --end-date
+     - 触发后回填：卖出日期/卖出价格/卖出股数/卖出盈亏/卖出原因/卖出税费
 
 说明：
 - 价格数据默认读取 `select_stocks_local.CFG.data_dir`（pytdx daily_raw 数据目录）。
 - 股票代码会自动补全市场后缀（.SH/.SZ），规则：
-  - 6开头 -> SH
-  - 0/2/3开头 -> SZ
+    - 6开头 -> SH
+    - 0/2/3开头 -> SZ
 """
-
+# python ./update_stop_loss_table.py --input ./output/买入明细.csv --end-date 20260120
 from __future__ import annotations
 
 import argparse
@@ -27,7 +26,7 @@ from dataclasses import asdict
 import pandas as pd
 
 import select_stocks_local as sel
-from stop_loss_rules import StopLossConfig, evaluate_exit_signal
+from stop_loss_rules import StopLossConfig, evaluate_exit_signal, get_close, get_open
 
 
 def _guess_market_suffix(code: str) -> str:
@@ -52,6 +51,48 @@ def _to_symbol(code: str) -> str:
 def _load_symbol_df(data_dir: str, symbol: str) -> pd.DataFrame:
     fp = os.path.join(data_dir, f"{symbol}.csv")
     return sel.load_csv(fp)
+
+
+def _calc_commission(amount: float, rate: float, minimum: float) -> float:
+    amt = max(float(amount or 0.0), 0.0)
+    if amt <= 0:
+        return 0.0
+    fee = amt * float(rate)
+    return float(max(fee, float(minimum)))
+
+
+def _calc_stamp_tax_sell(amount: float, rate: float) -> float:
+    amt = max(float(amount or 0.0), 0.0)
+    if amt <= 0:
+        return 0.0
+    return float(amt * float(rate))
+
+
+def _get_next_open(symbol_df: pd.DataFrame, date: pd.Timestamp) -> tuple[pd.Timestamp | None, float | None]:
+    """取 date 下一交易日开盘价（若无则返回 (None, None)）。"""
+    if symbol_df is None or symbol_df.empty:
+        return None, None
+
+    df = symbol_df[['trade_date'] + (["open"] if 'open' in symbol_df.columns else [])].dropna().copy()
+    df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
+    df = df.dropna().sort_values('trade_date')
+
+    d0 = pd.to_datetime(date).normalize()
+    sub = df[df['trade_date'] > d0]
+    if sub.empty:
+        return None, None
+
+    d1 = pd.to_datetime(sub['trade_date'].iloc[0])
+    px = get_open(symbol_df, d1)
+    if px is None:
+        return None, None
+    return d1, float(px)
+
+
+def _same_day(d1: pd.Timestamp | None, d2: pd.Timestamp | None) -> bool:
+    if d1 is None or d2 is None:
+        return False
+    return pd.to_datetime(d1).normalize() == pd.to_datetime(d2).normalize()
 
 
 def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, code: str, end_date: pd.Timestamp) -> dict:
@@ -129,36 +170,204 @@ def _calc_row(data_dir: str, sl_cfg: StopLossConfig, buy_date: pd.Timestamp, cod
     return out
 
 
+def _is_buy_detail_df(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    cols = set([str(c).strip() for c in df.columns])
+    # backtest 输出的“买入明细.csv”特征列
+    return ('买入日期' in cols) and ('卖出日期' in cols) and ('买入价格' in cols) and ('卖出原因' in cols) and ('代码' in cols)
+
+
+def _update_buy_detail_row(
+    data_dir: str,
+    sl_cfg: StopLossConfig,
+    r: pd.Series,
+    end_date: pd.Timestamp,
+) -> dict:
+    # 读入字段（尽量温和）
+    code = str(r.get('代码', '')).strip()
+    if not code:
+        return r.to_dict()
+
+    buy_date = pd.to_datetime(r.get('买入日期', ''), errors='coerce')
+    if pd.isna(buy_date):
+        return r.to_dict()
+
+    # 已有平仓信息则不覆盖
+    sell_date_raw = str(r.get('卖出日期', '')).strip()
+    sell_reason_raw = str(r.get('卖出原因', '')).strip()
+    sell_price_raw = str(r.get('卖出价格', '')).strip()
+    if sell_date_raw or sell_reason_raw or sell_price_raw:
+        return r.to_dict()
+
+    buy_price = pd.to_numeric(r.get('买入价格', 0), errors='coerce')
+    buy_shares = pd.to_numeric(r.get('买入股数', 0), errors='coerce')
+    buy_fees = pd.to_numeric(r.get('买入税费', 0), errors='coerce')
+
+    if pd.isna(buy_price) or float(buy_price) <= 0:
+        return r.to_dict()
+    if pd.isna(buy_shares) or int(buy_shares) <= 0:
+        return r.to_dict()
+
+    symbol = _to_symbol(code)
+    df = _load_symbol_df(data_dir, symbol)
+    if df is None or df.empty:
+        return r.to_dict()
+
+    # 选取买入日至 end_date 的数据（含端点）
+    df2 = df[(df['trade_date'] >= buy_date) & (df['trade_date'] <= end_date)].copy()
+    if df2.empty:
+        return r.to_dict()
+
+    # pos 结构对齐 stop_loss_rules
+    signal_date = pd.to_datetime(r.get('信号日期', buy_date), errors='coerce')
+    if pd.isna(signal_date):
+        signal_date = buy_date
+
+    pos = {
+        'shares': int(buy_shares),
+        'entry_price': float(buy_price),
+        'buy_date': buy_date,
+        'peak_close': None,
+        'signal_date': signal_date,
+        'signal_open': None,
+    }
+
+    closed = False
+    trigger_date: pd.Timestamp | None = None
+    reasons: list[str] = []
+
+    for d in df2['trade_date'].sort_values().tolist():
+        d = pd.to_datetime(d)
+        should_exit, rs = evaluate_exit_signal(sl_cfg, df2, pos, d)
+        if should_exit:
+            # 至少持有 1 天：避免买卖同日
+            if _same_day(d, buy_date):
+                continue
+            closed = True
+            trigger_date = d
+            reasons = rs or []
+            break
+
+    if not closed or trigger_date is None:
+        return r.to_dict()
+
+    # 执行价/执行日：
+    # - 跌破信号日开盘价止损：下一交易日开盘
+    # - 其他原因：触发日收盘
+    exec_date: pd.Timestamp | None
+    exec_price: float | None
+    if any(('跌破信号日开盘价止损' in (x or '')) for x in reasons):
+        exec_date, exec_price = _get_next_open(df2, trigger_date)
+    else:
+        exec_date, exec_price = trigger_date, get_close(df2, trigger_date)
+
+    # 兜底：不允许同日卖出；若同日则尝试下一交易日开盘
+    if _same_day(exec_date, buy_date):
+        exec_date, exec_price = _get_next_open(df2, trigger_date)
+
+    if exec_date is None or exec_price is None or float(exec_price) <= 0:
+        return r.to_dict()
+
+    # 费用口径：沿用 backtest 默认费率
+    try:
+        import backtest_select_stocks_local as bt
+
+        commission_rate = float(getattr(bt.CFG, 'commission_rate', 0.000085))
+        commission_min = float(getattr(bt.CFG, 'commission_min', 0.1))
+        stamp_tax_rate_sell = float(getattr(bt.CFG, 'stamp_tax_rate_sell', 0.0005))
+    except Exception:
+        commission_rate = 0.000085
+        commission_min = 0.1
+        stamp_tax_rate_sell = 0.0005
+
+    proceeds = float(exec_price) * int(buy_shares)
+    sell_commission = _calc_commission(proceeds, commission_rate, commission_min)
+    sell_stamp_tax = _calc_stamp_tax_sell(proceeds, stamp_tax_rate_sell)
+    sell_fees = sell_commission + sell_stamp_tax
+
+    # 盈亏口径：与 backtest 一致（扣买入佣金 + 卖出成本）
+    buy_fees_v = 0.0 if pd.isna(buy_fees) else float(buy_fees)
+    pnl = (float(exec_price) - float(buy_price)) * int(buy_shares) - buy_fees_v - float(sell_fees)
+
+    out = r.to_dict()
+    out['卖出日期'] = pd.to_datetime(exec_date).strftime('%Y-%m-%d')
+    out['卖出价格'] = round(float(exec_price), 4)
+    out['卖出股数'] = int(buy_shares)
+    out['卖出税费'] = round(float(sell_fees), 2)
+    out['卖出盈亏'] = round(float(pnl), 2)
+    out['卖出原因'] = '_AND_'.join([str(x) for x in reasons if str(x).strip()]) or 'SELL'
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default=os.path.join("wh", "qyb.csv"))
-    parser.add_argument("--output", default=os.path.join("wh", "qyb.csv"))
+    parser.add_argument("--output", default="")
     parser.add_argument("--end-date", default=datetime_today_yyyymmdd())
 
     # 止损策略参数（默认沿用 stop_loss_rules.py 默认值）
     parser.add_argument("--stop-loss-drawdown", type=float, default=StopLossConfig().stop_loss_drawdown)
     parser.add_argument("--enable-three-days-down-exit", action="store_true", default=StopLossConfig().enable_three_days_down_exit)
     parser.add_argument("--disable-early-underperform-exit", action="store_true")
-    # 默认从 7 改为 5 个交易日
-    parser.add_argument("--early-exit-hold-days", type=int, default=StopLossConfig().early_exit_hold_days)
-    parser.add_argument("--early-exit-min-return", type=float, default=StopLossConfig().early_exit_min_return)
+    # 早期弱势卖出：每 step_days 个交易日，最低涨幅门槛增加 step_min_return
+    # 兼容旧参数名：--early-exit-hold-days/--early-exit-min-return
+    parser.add_argument(
+        "--early-exit-step-days",
+        "--early-exit-hold-days",
+        dest="early_exit_step_days",
+        type=int,
+        default=StopLossConfig().early_exit_step_days,
+    )
+    parser.add_argument(
+        "--early-exit-step-min-return",
+        "--early-exit-min-return",
+        dest="early_exit_step_min_return",
+        type=float,
+        default=StopLossConfig().early_exit_step_min_return,
+    )
 
     args = parser.parse_args()
 
     end_date = pd.to_datetime(args.end_date)
 
+    input_path = args.input
+    output_path = args.output.strip() if str(args.output).strip() else input_path
+
     sl_cfg = StopLossConfig(
         stop_loss_drawdown=float(args.stop_loss_drawdown),
         enable_three_days_down_exit=bool(args.enable_three_days_down_exit),
         enable_early_underperform_exit=not bool(args.disable_early_underperform_exit),
-        early_exit_hold_days=int(args.early_exit_hold_days),
-        early_exit_min_return=float(args.early_exit_min_return),
+        early_exit_step_days=int(args.early_exit_step_days),
+        early_exit_step_min_return=float(args.early_exit_step_min_return),
     )
 
     data_dir = sel.CFG.data_dir
 
-    df_in = pd.read_csv(args.input, dtype=str)
+    df_in = pd.read_csv(input_path, dtype=str)
     df_in = df_in.fillna("")
+
+    # 自动识别：买入明细模式
+    if _is_buy_detail_df(df_in):
+        # 兼容：缺列则补齐
+        required_cols = [
+            '代码', '信号日期',
+            '买入日期', '买入价格', '买入股数', '买入金额', '买入税费',
+            '卖出日期', '卖出价格', '卖出股数', '卖出盈亏', '卖出原因', '卖出税费',
+        ]
+        for c in required_cols:
+            if c not in df_in.columns:
+                df_in[c] = ""
+
+        rows = []
+        for _, r in df_in.iterrows():
+            rows.append(_update_buy_detail_row(data_dir, sl_cfg, r, end_date))
+
+        df_out = pd.DataFrame(rows, columns=[c for c in df_in.columns])
+        df_out.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"已更新买入明细平仓信息: {output_path}")
+        print(f"止损参数: {asdict(sl_cfg)}")
+        return
 
     # 兼容用户的旧表头（如果缺少列则补）
     required_cols = ["购买时间", "代码", "持仓成本", "收盘最高价", "止损价格", "持仓时间", "是否平仓", "平仓日期", "平仓原因"]
@@ -180,9 +389,9 @@ def main():
         rows.append(row_out)
 
     df_out = pd.DataFrame(rows, columns=required_cols)
-    df_out.to_csv(args.output, index=False, encoding="utf-8-sig")
+    df_out.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"已更新: {args.output}")
+    print(f"已更新: {output_path}")
     print(f"止损参数: {asdict(sl_cfg)}")
 
 
