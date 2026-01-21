@@ -11,6 +11,116 @@ from dataclasses import dataclass
 from dataclasses import field
 from typing import List
 
+# 正常跑选股：python select_stocks_local.py
+# 同时更新维护表单：python [select_stocks_local.py](http://_vscodecontentref_/7) --update-form
+# 指定某天并更新表单：python [select_stocks_local.py](http://_vscodecontentref_/8) --end-date 20260121 --update-form
+def _update_selection_maintain_form(
+    selected_df_cn: pd.DataFrame,
+    signal_date_yyyymmdd: str,
+    form_path: str,
+) -> None:
+    """增量更新“选股维护表单”。
+
+    目标：每天跑完选股后，把当日信号写进一个可维护 CSV；
+    - 只新增不存在的 (信号日, 股票代码) 组合
+    - 不覆盖人工维护字段：是否平仓/平仓日期/平仓原因
+    - 若历史行的“原始评分”为空，则可用本次评分补齐
+    """
+
+    if selected_df_cn is None or selected_df_cn.empty:
+        return
+
+    def _norm_str(v) -> str:
+        if v is None or (isinstance(v, float) and pd.isna(v)) or pd.isna(v):
+            return ''
+        return str(v).strip()
+
+    def _norm_int_str(v) -> str:
+        """把评分转成整数文本；缺失则返回空字符串。"""
+        s = _norm_str(v)
+        if s == '':
+            return ''
+        try:
+            x = float(s)
+            if pd.isna(x):
+                return ''
+            return str(int(round(x)))
+        except Exception:
+            return ''
+
+    # 从选股输出中抽取“股票代码/原始评分”
+    if '标的' in selected_df_cn.columns:
+        codes = selected_df_cn['标的'].map(_norm_str)
+    elif '代码' in selected_df_cn.columns and '市场' in selected_df_cn.columns:
+        codes = (selected_df_cn['代码'].map(_norm_str) + '.' + selected_df_cn['市场'].map(_norm_str)).str.strip('.')
+    elif '代码' in selected_df_cn.columns:
+        codes = selected_df_cn['代码'].map(_norm_str)
+    else:
+        raise ValueError('选股结果缺少“标的/代码”列，无法生成维护表单')
+
+    if '原始评分' in selected_df_cn.columns:
+        raw_scores = selected_df_cn['原始评分'].map(_norm_int_str)
+    elif 'raw_score' in selected_df_cn.columns:
+        raw_scores = selected_df_cn['raw_score'].map(_norm_int_str)
+    elif '评分' in selected_df_cn.columns:
+        raw_scores = selected_df_cn['评分'].map(_norm_int_str)
+    else:
+        raw_scores = pd.Series([''] * len(selected_df_cn))
+
+    new_rows = pd.DataFrame(
+        {
+            '信号日': [signal_date_yyyymmdd] * len(selected_df_cn),
+            '股票代码': codes,
+            '原始评分': raw_scores,
+            '是否平仓': [''] * len(selected_df_cn),
+            '平仓日期': [''] * len(selected_df_cn),
+            '平仓原因': [''] * len(selected_df_cn),
+        }
+    )
+    new_rows = new_rows[(new_rows['股票代码'] != '')].copy()
+    if new_rows.empty:
+        return
+
+    os.makedirs(os.path.dirname(form_path), exist_ok=True)
+
+    required_cols = ['信号日', '股票代码', '原始评分', '是否平仓', '平仓日期', '平仓原因']
+    if os.path.exists(form_path):
+        old = pd.read_csv(form_path, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+        for c in required_cols:
+            if c not in old.columns:
+                old[c] = ''
+        old = old[required_cols].copy()
+
+        # 用 (信号日, 股票代码) 作为唯一键
+        old_key = (old['信号日'].map(_norm_str) + '|' + old['股票代码'].map(_norm_str)).tolist()
+        new_key = (new_rows['信号日'].map(_norm_str) + '|' + new_rows['股票代码'].map(_norm_str)).tolist()
+
+        old_key_set = set(old_key)
+
+        # 仅追加新键
+        append_mask = [k not in old_key_set for k in new_key]
+        appended = new_rows.loc[append_mask, required_cols].copy()
+
+        # 补齐：若历史行“原始评分”为空，则用本次对应值补上（不动平仓字段）
+        if '原始评分' in old.columns:
+            old_key_to_idx: dict[str, int] = {}
+            for i, k in enumerate(old_key):
+                if k and k not in old_key_to_idx:
+                    old_key_to_idx[k] = i
+            for i, k in enumerate(new_key):
+                idx = old_key_to_idx.get(k)
+                if idx is None:
+                    continue
+                if _norm_str(old.at[idx, '原始评分']) == '' and _norm_str(new_rows.at[i, '原始评分']) != '':
+                    old.at[idx, '原始评分'] = _norm_str(new_rows.at[i, '原始评分'])
+
+        out = pd.concat([old, appended], ignore_index=True)
+    else:
+        out = new_rows[required_cols].copy()
+
+    out.to_csv(form_path, index=False, encoding='utf-8-sig')
+
+
 # python select_stocks_local.py --end-date 20260110
 # python select_stocks_local.py --end-date 20251013 --debug-symbol 600868.SH
 
@@ -1195,12 +1305,14 @@ def main():
     end_date_arg = None
     quiet_arg = False
     debug_symbol_arg = None
+    update_form_arg = False
     try:
         import argparse
         parser = argparse.ArgumentParser(description='本地CSV选股')
         parser.add_argument('--end-date', type=str, help='指定筛选截止日期(YYYYMMDD)，默认今天')
         parser.add_argument('--quiet', action='store_true', help='静默模式，减少日志输出')
         parser.add_argument('--debug-symbol', type=str, help='调试单票未触发原因，例如 603598.SH（配合 --end-date）')
+        parser.add_argument('--update-form', action='store_true', help='增量更新当日选股维护表单（output/选股维护表单.csv）')
         args, _ = parser.parse_known_args()
         if args.end_date:
             try:
@@ -1210,6 +1322,7 @@ def main():
         quiet_arg = bool(args.quiet)
         if getattr(args, 'debug_symbol', None):
             debug_symbol_arg = str(args.debug_symbol).strip()
+        update_form_arg = bool(getattr(args, 'update_form', False))
     except Exception:
         pass
 
@@ -1230,9 +1343,12 @@ def main():
     pe_min = CFG.pe_min
     pe_max = CFG.pe_max
 
+    # 信号日（YYYYMMDD）：用于输出目录与维护表单
+    signal_date_yyyymmdd = datetime.today().strftime('%Y%m%d') if end_date_arg is None else pd.to_datetime(end_date_arg).strftime('%Y%m%d')
+
     # 处理按日期子目录
     if date_subdir:
-        date_str = datetime.today().strftime('%Y%m%d') if end_date_arg is None else pd.to_datetime(end_date_arg).strftime('%Y%m%d')
+        date_str = signal_date_yyyymmdd
         out_dir = os.path.dirname(out_path) if out_path.lower().endswith('.csv') else out_path
         out_dir = os.path.join(out_dir, date_str)
         base_name = os.path.basename(out_path) if out_path.lower().endswith('.csv') else os.path.basename(CFG.default_out)
@@ -1316,6 +1432,11 @@ def main():
     }
     df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
 
+    # 原始评分取整数（展示口径）：空值保持为空
+    if '原始评分' in df.columns:
+        _rs = pd.to_numeric(df['原始评分'], errors='coerce')
+        df['原始评分'] = _rs.round(0).astype('Int64').astype(str).replace('<NA>', '')
+
     # 排序：优先评分（高分靠前），再按振幅（低振幅靠前）
     if '评分' in df.columns:
         df = df.sort_values(['评分', '振幅(%)'], ascending=[False, True]).reset_index(drop=True)
@@ -1329,6 +1450,13 @@ def main():
 
     df.to_csv(out_path, index=False, encoding='utf-8-sig')
     print(f"已保存到: {out_path} | 入选数量: {len(df)} | 截止日期: {(pd.to_datetime(end_date_arg).strftime('%Y-%m-%d') if end_date_arg is not None else datetime.today().strftime('%Y-%m-%d'))}")
+
+    # 维护表单：每天增量更新当日选股结果（可手工填写平仓信息）
+    if update_form_arg:
+        form_path = os.path.join(os.path.dirname(__file__), 'output', '选股维护表单.csv')
+        _update_selection_maintain_form(df, signal_date_yyyymmdd=signal_date_yyyymmdd, form_path=form_path)
+        if not quiet_arg:
+            print(f"已更新维护表单: {form_path}")
 
 
 if __name__ == '__main__':

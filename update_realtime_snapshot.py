@@ -222,43 +222,55 @@ def main():
     )
     args = parser.parse_args()
 
-    data_dir = os.path.abspath(args.data_dir)
-    today = args.date
+    try:
+        data_dir = os.path.abspath(args.data_dir)
+        today = args.date
 
-    if not os.path.isdir(data_dir):
-        print(f"目录不存在: {data_dir}")
+        if not os.path.isdir(data_dir):
+            raise RuntimeError(f"目录不存在: {data_dir}")
+
+        print("拉取快照中……", flush=True)
+        snapshot = load_spot_snapshot()
+        print(f"快照股票数: {len(snapshot)}")
+
+        # 遍历 CSV 文件
+        updated_count = 0
+        skipped_count = 0
+        missing_count = 0
+        failed_count = 0
+        files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
+
+        for fname in files:
+            # 文件名形如 000001.SZ.csv
+            base = os.path.splitext(fname)[0]  # 000001.SZ
+            symbol = base
+            row = snapshot.get(symbol)
+            csv_path = os.path.join(data_dir, fname)
+
+            if row is None:
+                missing_count += 1
+                continue
+
+            if args.dry_run:
+                print(f"[DRY] {symbol}: {row}")
+                skipped_count += 1
+                continue
+
+            try:
+                if update_csv_file(csv_path, today, row):
+                    updated_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"更新失败: {symbol} ({csv_path}) -> {e}", file=sys.stderr)
+
+        print(
+            f"更新完成：写入 {updated_count} 个文件；跳过 {skipped_count}；未匹配 {missing_count}；失败 {failed_count}。"
+        )
+        if failed_count > 0:
+            sys.exit(1)
+    except Exception as e:
+        print(f"更新失败：{e}", file=sys.stderr)
         sys.exit(1)
-
-    print("拉取快照中……")
-    snapshot = load_spot_snapshot()
-    print(f"快照股票数: {len(snapshot)}")
-
-    # 遍历 CSV 文件
-    updated_count = 0
-    skipped_count = 0
-    missing_count = 0
-    files = [f for f in os.listdir(data_dir) if f.endswith(".csv")]
-
-    for fname in files:
-        # 文件名形如 000001.SZ.csv
-        base = os.path.splitext(fname)[0]  # 000001.SZ
-        symbol = base
-        row = snapshot.get(symbol)
-        csv_path = os.path.join(data_dir, fname)
-
-        if row is None:
-            missing_count += 1
-            continue
-
-        if args.dry_run:
-            print(f"[DRY] {symbol}: {row}")
-            skipped_count += 1
-            continue
-
-        if update_csv_file(csv_path, today, row):
-            updated_count += 1
-
-    print(f"更新完成：写入 {updated_count} 个文件；跳过 {skipped_count}；未匹配 {missing_count}。")
 
 
 if __name__ == "__main__":

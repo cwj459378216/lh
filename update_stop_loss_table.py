@@ -15,6 +15,8 @@
 - 股票代码会自动补全市场后缀（.SH/.SZ），规则：
     - 6开头 -> SH
     - 0/2/3开头 -> SZ
+    
+    python ./update_stop_loss_table.py --input ./output/选股维护表单.csv --end-date 20260120 --update-selection-form --only-fill-empty
 """
 # python ./update_stop_loss_table.py --input ./output/买入明细.csv --end-date 20260120
 from __future__ import annotations
@@ -178,6 +180,100 @@ def _is_buy_detail_df(df: pd.DataFrame) -> bool:
     return ('买入日期' in cols) and ('卖出日期' in cols) and ('买入价格' in cols) and ('卖出原因' in cols) and ('代码' in cols)
 
 
+def _is_selection_form_df(df: pd.DataFrame) -> bool:
+    """识别 output/选股维护表单.csv 结构。"""
+    if df is None or df.empty:
+        return False
+    cols = set([str(c).strip() for c in df.columns])
+    return ('信号日' in cols) and ('股票代码' in cols) and ('是否平仓' in cols) and ('平仓日期' in cols) and ('平仓原因' in cols)
+
+
+def _is_blank(v) -> bool:
+    if v is None:
+        return True
+    s = str(v).strip()
+    return s == "" or s.lower() in {"nan", "none"}
+
+
+def _update_selection_form_row(
+    data_dir: str,
+    sl_cfg: StopLossConfig,
+    r: pd.Series,
+    end_date: pd.Timestamp,
+    only_fill_empty: bool = False,
+) -> dict:
+    """维护“选股维护表单”：更新 是否平仓/平仓日期/平仓原因。"""
+    out = r.to_dict()
+
+    if only_fill_empty:
+        v1 = r.get('是否平仓', '')
+        v2 = r.get('平仓日期', '')
+        v3 = r.get('平仓原因', '')
+        # 任一已有值则不覆盖
+        if (not _is_blank(v1)) or (not _is_blank(v2)) or (not _is_blank(v3)):
+            return out
+
+    code = str(r.get('股票代码', '')).strip()
+    if not code:
+        return out
+
+    signal_date = pd.to_datetime(r.get('信号日', ''), errors='coerce')
+    if pd.isna(signal_date):
+        return out
+
+    symbol = _to_symbol(code)
+    df = _load_symbol_df(data_dir, symbol)
+    if df is None or df.empty:
+        # 数据缺失：不强行写“否”，避免误导
+        return out
+
+    df_all = df[df['trade_date'] <= end_date].copy()
+    if df_all.empty:
+        return out
+
+    df_iter = df_all[(df_all['trade_date'] >= signal_date) & (df_all['trade_date'] <= end_date)].copy()
+    if df_iter.empty:
+        return out
+
+    # entry_price：按信号日开盘价；若缺失则回退到信号日收盘价
+    entry_price = get_open(df_all, signal_date)
+    if entry_price is None:
+        entry_price = get_close(df_all, signal_date)
+    if entry_price is None or float(entry_price) <= 0:
+        return out
+
+    pos = {
+        'entry_price': float(entry_price),
+        'buy_date': signal_date,
+        'peak_close': None,
+        'signal_date': signal_date,
+        'signal_open': float(entry_price),
+    }
+
+    closed = False
+    close_date: pd.Timestamp | None = None
+    close_reason: str = ''
+
+    for d in df_iter['trade_date'].sort_values().tolist():
+        d = pd.to_datetime(d)
+        should_exit, reasons = evaluate_exit_signal(sl_cfg, df_all, pos, d)
+        if should_exit:
+            closed = True
+            close_date = d
+            close_reason = '_AND_'.join([str(x) for x in (reasons or []) if str(x).strip()]) or 'SELL'
+            break
+
+    out['是否平仓'] = '是' if closed else '否'
+    if closed and close_date is not None:
+        out['平仓日期'] = pd.to_datetime(close_date).strftime('%Y%m%d')
+        out['平仓原因'] = close_reason
+    else:
+        out['平仓日期'] = ''
+        out['平仓原因'] = ''
+
+    return out
+
+
 def _update_buy_detail_row(
     data_dir: str,
     sl_cfg: StopLossConfig,
@@ -214,10 +310,33 @@ def _update_buy_detail_row(
     if df is None or df.empty:
         return r.to_dict()
 
-    # 选取买入日至 end_date 的数据（含端点）
-    df2 = df[(df['trade_date'] >= buy_date) & (df['trade_date'] <= end_date)].copy()
-    if df2.empty:
+    # 关键：规则“跌破信号日开盘价止损”需要能读取 signal_date 当天的 open。
+    # 因此评估止损与取价都使用 df_all（截止到 end_date 的全量数据）。
+    df_all = df[df['trade_date'] <= end_date].copy()
+    if df_all.empty:
         return r.to_dict()
+
+    # 遍历评估区间：从买入日到 end_date（含端点）
+    df_iter = df_all[(df_all['trade_date'] >= buy_date) & (df_all['trade_date'] <= end_date)].copy()
+    if df_iter.empty:
+        return r.to_dict()
+
+    # 成交规则：完全遵循 backtest CFG.sell_price_mode（close/next_open）
+    # 持股天数规则：遵循 backtest CFG.min_hold_days（不满足则跳过本次触发，继续往后找）
+    try:
+        import backtest_select_stocks_local as bt
+
+        sell_price_mode = str(getattr(bt.CFG, 'sell_price_mode', 'close') or 'close').lower().strip()
+        min_hold_days = int(getattr(bt.CFG, 'min_hold_days', 1) or 0)
+        commission_rate = float(getattr(bt.CFG, 'commission_rate', 0.000085))
+        commission_min = float(getattr(bt.CFG, 'commission_min', 0.1))
+        stamp_tax_rate_sell = float(getattr(bt.CFG, 'stamp_tax_rate_sell', 0.0005))
+    except Exception:
+        sell_price_mode = 'close'
+        min_hold_days = 1
+        commission_rate = 0.000085
+        commission_min = 0.1
+        stamp_tax_rate_sell = 0.0005
 
     # pos 结构对齐 stop_loss_rules
     signal_date = pd.to_datetime(r.get('信号日期', buy_date), errors='coerce')
@@ -234,52 +353,45 @@ def _update_buy_detail_row(
     }
 
     closed = False
-    trigger_date: pd.Timestamp | None = None
     reasons: list[str] = []
+    exec_date: pd.Timestamp | None = None
+    exec_price: float | None = None
 
-    for d in df2['trade_date'].sort_values().tolist():
+    for d in df_iter['trade_date'].sort_values().tolist():
         d = pd.to_datetime(d)
-        should_exit, rs = evaluate_exit_signal(sl_cfg, df2, pos, d)
-        if should_exit:
-            # 至少持有 1 天：避免买卖同日
-            if _same_day(d, buy_date):
-                continue
-            closed = True
-            trigger_date = d
-            reasons = rs or []
-            break
 
-    if not closed or trigger_date is None:
+        should_exit, rs = evaluate_exit_signal(sl_cfg, df_all, pos, d)
+        if not should_exit:
+            continue
+
+        if sell_price_mode == 'next_open':
+            _sd, _sp = _get_next_open(df_all, d)
+        else:
+            _sd, _sp = d, get_close(df_all, d)
+
+        if _sd is None or _sp is None or float(_sp) <= 0:
+            continue
+
+        # 买卖不能同日
+        if _same_day(_sd, buy_date):
+            continue
+
+        # 最少持股天数（以成交日为准）
+        if min_hold_days > 0:
+            try:
+                held_days = (pd.to_datetime(_sd).normalize() - pd.to_datetime(buy_date).normalize()).days
+                if held_days < int(min_hold_days):
+                    continue
+            except Exception:
+                pass
+
+        closed = True
+        exec_date, exec_price = pd.to_datetime(_sd), float(_sp)
+        reasons = rs or []
+        break
+
+    if not closed or exec_date is None or exec_price is None:
         return r.to_dict()
-
-    # 执行价/执行日：
-    # - 跌破信号日开盘价止损：下一交易日开盘
-    # - 其他原因：触发日收盘
-    exec_date: pd.Timestamp | None
-    exec_price: float | None
-    if any(('跌破信号日开盘价止损' in (x or '')) for x in reasons):
-        exec_date, exec_price = _get_next_open(df2, trigger_date)
-    else:
-        exec_date, exec_price = trigger_date, get_close(df2, trigger_date)
-
-    # 兜底：不允许同日卖出；若同日则尝试下一交易日开盘
-    if _same_day(exec_date, buy_date):
-        exec_date, exec_price = _get_next_open(df2, trigger_date)
-
-    if exec_date is None or exec_price is None or float(exec_price) <= 0:
-        return r.to_dict()
-
-    # 费用口径：沿用 backtest 默认费率
-    try:
-        import backtest_select_stocks_local as bt
-
-        commission_rate = float(getattr(bt.CFG, 'commission_rate', 0.000085))
-        commission_min = float(getattr(bt.CFG, 'commission_min', 0.1))
-        stamp_tax_rate_sell = float(getattr(bt.CFG, 'stamp_tax_rate_sell', 0.0005))
-    except Exception:
-        commission_rate = 0.000085
-        commission_min = 0.1
-        stamp_tax_rate_sell = 0.0005
 
     proceeds = float(exec_price) * int(buy_shares)
     sell_commission = _calc_commission(proceeds, commission_rate, commission_min)
@@ -305,6 +417,18 @@ def main():
     parser.add_argument("--input", default=os.path.join("wh", "qyb.csv"))
     parser.add_argument("--output", default="")
     parser.add_argument("--end-date", default=datetime_today_yyyymmdd())
+
+    # 维护“选股维护表单.csv”模式
+    parser.add_argument(
+        "--update-selection-form",
+        action="store_true",
+        help="维护 output/选股维护表单.csv：更新 是否平仓/平仓日期/平仓原因",
+    )
+    parser.add_argument(
+        "--only-fill-empty",
+        action="store_true",
+        help="只填空白：当平仓三列已有任一值时不覆盖",
+    )
 
     # 止损策略参数（默认沿用 stop_loss_rules.py 默认值）
     parser.add_argument("--stop-loss-drawdown", type=float, default=StopLossConfig().stop_loss_drawdown)
@@ -346,6 +470,23 @@ def main():
 
     df_in = pd.read_csv(input_path, dtype=str)
     df_in = df_in.fillna("")
+
+    # 强制：选股维护表单模式
+    if bool(args.update_selection_form) or _is_selection_form_df(df_in):
+        required_cols = ['信号日', '股票代码', '原始评分', '是否平仓', '平仓日期', '平仓原因']
+        for c in required_cols:
+            if c not in df_in.columns:
+                df_in[c] = ""
+
+        rows = []
+        for _, r in df_in.iterrows():
+            rows.append(_update_selection_form_row(data_dir, sl_cfg, r, end_date, only_fill_empty=bool(args.only_fill_empty)))
+
+        df_out = pd.DataFrame(rows, columns=[c for c in df_in.columns])
+        df_out.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"已更新选股维护表单平仓信息: {output_path}")
+        print(f"止损参数: {asdict(sl_cfg)}")
+        return
 
     # 自动识别：买入明细模式
     if _is_buy_detail_df(df_in):

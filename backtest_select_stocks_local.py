@@ -28,7 +28,7 @@ class BacktestConfig:
     only_10pct_a: bool = sel.CFG.only_10pct_a
     # 回测范围
     start_date: str = '20260101'
-    end_date: str = '20260116'
+    end_date: str = '20260119'
     # 回测交易参数
     initial_capital: float = 1000000.0          # 初始资金
     buy_mode: str = 'ratio'                     # 买入模式: 'fixed' 固定金额, 'ratio' 按百分比
@@ -72,7 +72,7 @@ class BacktestConfig:
     # 新增：回测结束时，未卖出持仓是否用“最后一日收盘价”进行统计性平仓
     # - True: 若无法按 sell_price_mode 获取成交价，则退化为用最后收盘价（或 peak_close/成本价兜底）
     # - False: 若无法成交则不做平仓记录，期末权益也不把这些仓位折算为现金
-    close_open_positions_at_end: bool = True
+    close_open_positions_at_end: bool = False
 
     # ratio 模式：当日候选多于可买名额时的“优先级排序”配置
     # 说明：列表从前到后为优先级（先按第1个字段，再按第2个字段...）。
@@ -560,12 +560,9 @@ def main():
                 if not should_exit:
                     continue
 
-                # 针对“跌破信号日开盘价止损”：要求在触发日的下一交易日开盘卖出
-                # 其他止损原因按 cfg.sell_price_mode 执行，但必须满足“买卖不同日”
-                if any(('跌破信号日开盘价止损' in r) for r in (reasons or [])):
-                    sell_date, sell_price = _get_next_open(sym_df, d)
-                else:
-                    sell_date, sell_price = _get_sell_price_no_same_day(cfg, sym_df, d, buy_exec_date)
+                # 完全遵循 cfg.sell_price_mode（close/next_open）执行成交价与成交日。
+                # 仍需满足“买卖不同日”的约束。
+                sell_date, sell_price = _get_sell_price_no_same_day(cfg, sym_df, d, buy_exec_date)
 
                 # 规则：买卖不能同一天（最终成交日校验）
                 if _same_trading_day(sell_date, buy_exec_date):
