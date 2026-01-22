@@ -5,3 +5,4 @@ python-dateutil>=2.9.0.post0
 akshare>=1.14.99
 pytdx>=1.72
 schedule>=1.2.2
+chinese_calendar>=1.10.0
