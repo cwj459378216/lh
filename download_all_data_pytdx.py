@@ -85,7 +85,7 @@ def _local_security_list(lday_dirs: list[str]) -> pd.DataFrame:
     return df.sort_values(['market', 'code']).reset_index(drop=True)
 
 
-def _fetch_daily_from_file(file_path: str, start_date: str, end_date: str) -> pd.DataFrame:
+def _fetch_daily_from_file(file_path: str, start_date: str | None, end_date: str | None) -> pd.DataFrame:
     if TdxDailyBarReader is None:
         tqdm.write('缺少 TdxDailyBarReader，无法读取本地 day 文件。')
         return pd.DataFrame()
@@ -96,6 +96,7 @@ def _fetch_daily_from_file(file_path: str, start_date: str, end_date: str) -> pd
         return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
+
     # 标准化列
     if 'date' in df.columns:
         df['trade_date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
@@ -107,6 +108,7 @@ def _fetch_daily_from_file(file_path: str, start_date: str, end_date: str) -> pd
             df['trade_date'] = pd.to_datetime(df.index, errors='coerce').date
         except Exception:
             return pd.DataFrame()
+
     # 数值列
     rename_map = {}
     if 'vol' in df.columns:
@@ -125,6 +127,7 @@ def _fetch_daily_from_file(file_path: str, start_date: str, end_date: str) -> pd
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
     if 'amount' in df.columns:
         df['amount'] = pd.to_numeric(df['amount'], errors='coerce')
+
     # 选列与排序
     keep = ['trade_date', 'open', 'high', 'low', 'close', 'volume', 'amount']
     for k in keep:
@@ -133,11 +136,16 @@ def _fetch_daily_from_file(file_path: str, start_date: str, end_date: str) -> pd
             df[k] = pd.NA
     df = df[keep]
     df = df.dropna(subset=['trade_date']).sort_values('trade_date')
-    # 过滤区间
-    sdt = datetime.strptime(start_date, '%Y%m%d').date()
-    edt = datetime.strptime(end_date, '%Y%m%d').date()
-    df = df[(df['trade_date'] >= sdt) & (df['trade_date'] <= edt)].reset_index(drop=True)
-    return df
+
+    # 过滤区间（start_date 允许为 None，表示不过滤起始时间；end_date 允许为 None，表示不过滤结束时间）
+    sdt = datetime.strptime(start_date, '%Y%m%d').date() if start_date else None
+    edt = datetime.strptime(end_date, '%Y%m%d').date() if end_date else None
+    if sdt is not None:
+        df = df[df['trade_date'] >= sdt]
+    if edt is not None:
+        df = df[df['trade_date'] <= edt]
+
+    return df.reset_index(drop=True)
 
 
 def _load_names_csv(path: str) -> pd.DataFrame:
@@ -191,7 +199,7 @@ def _clear_output_dir(path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='仅使用本地通达信 vipdoc 日线文件导出最近一年数据（A股10%涨停上限，原始价量）')
+    parser = argparse.ArgumentParser(description='仅使用本地通达信 vipdoc 日线文件导出全部历史数据（A股10%涨停上限，原始价量）')
     parser.add_argument('--tdx-lday', type=str, required=True, help='通达信 vipdoc 目录，或其下的 sh/lday、sz/lday 路径，例如 D:\\tdx\\vipdoc 或 D:\\tdx\\vipdoc\\sh\\lday')
     parser.add_argument('--out', default=os.path.join(os.path.dirname(__file__), 'data', 'pytdx', 'daily_raw'), help='输出目录')
     parser.add_argument('--overwrite', action='store_true', help='已存在是否覆盖')
@@ -204,8 +212,7 @@ def main():
     _clear_output_dir(args.out)
 
     end = datetime.today().date()
-    start = end - relativedelta(months=120)
-    start_str = start.strftime('%Y%m%d')
+    start_str = None
     end_str = end.strftime('%Y%m%d')
 
     # 本地模式
@@ -223,7 +230,7 @@ def main():
     if args.limit:
         uni = uni.head(args.limit)
 
-    print(f"[vipdoc] 标的数: {len(uni)} | 区间: {start_str} ~ {end_str} | 源: {', '.join(lday_dirs)} | 输出: {args.out}")
+    print(f"[vipdoc] 标的数: {len(uni)} | 区间: 全量 ~ {end_str} | 源: {', '.join(lday_dirs)} | 输出: {args.out}")
 
     pbar = tqdm(total=len(uni), desc='导出中(vipdoc)', dynamic_ncols=True)
     saved = 0

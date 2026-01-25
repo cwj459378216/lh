@@ -1,11 +1,11 @@
 import pandas as pd
 
-path = r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260117_2016\买入明细.csv"
+path = r"E:\work\SynologyDrive\量化交易\通达信\autoTest\output\回测20年_90c80c52\20260123_2058\买入明细.csv"
 
 # 新增：如果存在“权益曲线.csv”，则按年指标优先从权益曲线计算（更准）
 EQUITY_CURVE_CANDIDATES = [
-    r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260117_2016\权益曲线.csv",
-    r"e:\work\SynologyDrive\量化交易\通达信\output\backtest\20260117_2016\equity_curve.csv",
+    r"E:\work\SynologyDrive\量化交易\通达信\autoTest\output\回测20年_90c80c52\20260123_2058\权益曲线.csv",
+    r"E:\work\SynologyDrive\量化交易\通达信\autoTest\output\回测20年_90c80c52\20260123_2058\equity_curve.csv",
 ]
 
 df = pd.read_csv(path, encoding="utf-8-sig")
@@ -295,27 +295,18 @@ price_stat = (
       .reset_index(names="股价区间")
 )
 
-# 2) 一年内位置分段胜率（每 10% 一档）
-# 0-10,10-20,...,90-100,100%+
+# 2) 一年内位置分段胜率（每 5% 一档）
+# 0-5,5-10,...,95-100,100%+
 # 说明：同样用 [a,b)
+POS_STEP = 5
+POS_EDGES = [-float("inf"), *list(range(0, 101, POS_STEP)), float("inf")]
+POS_LABELS = ["<0"] + [f"{i}-{i+POS_STEP}" for i in range(0, 100, POS_STEP)] + ["100+"]
+
 pos_bins = pd.cut(
     df["前一日一年内位置(%)"],
-    bins=[-float("inf"), 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, float("inf")],
+    bins=POS_EDGES,
     right=False,
-    labels=[
-        "<0",
-        "0-10",
-        "10-20",
-        "20-30",
-        "30-40",
-        "40-50",
-        "50-60",
-        "60-70",
-        "70-80",
-        "80-90",
-        "90-100",
-        "100+",
-    ],
+    labels=POS_LABELS,
 )
 pos_stat = (
     df.groupby(pos_bins, dropna=False, observed=False)
