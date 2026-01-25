@@ -159,14 +159,14 @@ class Config:
     # 新增：价格区间过滤（排除某些买入价区间）
     # exclude_price_ranges: list[tuple[float, float]] = ()
     # 例如 [(15,20),(25,30)] 表示排除 [15,20) 与 [25,30)
-    exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
-    # exclude_price_ranges: list[tuple[float, float]] = ()
+    # exclude_price_ranges: list[tuple[float, float]] = ((25.0, 30.0),)
+    exclude_price_ranges: list[tuple[float, float]] = ()
 
     # 新增：一年内位置过滤（排除某些位置区间，单位：%）
     # 例如 [(60, 1e9)] 表示排除 [60, +inf)
     # 例如 [(60, 70), (80, 90)] 表示排除 [60,70) 与 [80,90)
-    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
-    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
+    # exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ((0.0, 10.0), (80.0, 90.0))
+    exclude_pos_1y_ranges_pct: list[tuple[float, float]] = ()
 
     # 估值过滤（PE-TTM）：估值上下限，None 表示不限制
     pe_min: float | None = None       # PE(TTM)下限，例如10.0
@@ -250,44 +250,68 @@ ALLOW_PREFIXES_10P_SZ = ("000", "001", "002", "003")  # 深A
 # --- 打分配置（来自回测汇总输出）
 # 说明：以下胜率/平均盈亏来自你贴的统计表。若以后你更新统计，只需改这里即可。
 PRICE_SEG_STATS = {
-    "0-5": {"win_rate": 0.547619, "avg_pnl": 199.949000},
-    "5-10": {"win_rate": 0.420000, "avg_pnl": 42.254467},
-    "10-15": {"win_rate": 0.543478, "avg_pnl": 113.287826},
-    "15-20": {"win_rate": 0.440476, "avg_pnl": -23.591905},
-    "20-25": {"win_rate": 0.475000, "avg_pnl": -0.002250},
-    "25-30": {"win_rate": 0.352941, "avg_pnl": -75.239118},
-    "30+": {"win_rate": 0.444444, "avg_pnl": 44.042407},
+    "0-5": {"win_rate": 0.528455, "avg_pnl": 185.738374},
+    "5-10": {"win_rate": 0.444444, "avg_pnl": 80.576164},
+    "10-15": {"win_rate": 0.513661, "avg_pnl": 72.768415},
+    "15-20": {"win_rate": 0.439252, "avg_pnl": -75.905047},
+    "20-25": {"win_rate": 0.416667, "avg_pnl": -33.497917},
+    "25-30": {"win_rate": 0.390244, "avg_pnl": -34.026098},
+    "30+": {"win_rate": 0.441176, "avg_pnl": 23.018529},
 }
 
 POS_SEG_STATS = {
-    "<0": {"win_rate": None, "avg_pnl": None},
-    "0-10": {"win_rate": 0.388889, "avg_pnl": -11.345333},
-    "10-20": {"win_rate": 0.464481, "avg_pnl": 68.579399},
-    "20-30": {"win_rate": 0.478873, "avg_pnl": 96.020634},
-    "30-40": {"win_rate": 0.500000, "avg_pnl": 69.060844},
-    "40-50": {"win_rate": 0.555556, "avg_pnl": 129.442302},
-    "50-60": {"win_rate": 0.483871, "avg_pnl": 45.827204},
-    "60-70": {"win_rate": 0.404762, "avg_pnl": 121.017143},
-    "70-80": {"win_rate": 0.428571, "avg_pnl": 378.411905},
-    "80-90": {"win_rate": 0.222222, "avg_pnl": -140.286667},
+    "0-5": {"win_rate": 0.400000, "avg_pnl": 3.912000},
+    "5-10": {"win_rate": 0.398058, "avg_pnl": 24.659612},
+    "10-15": {"win_rate": 0.438596, "avg_pnl": -78.763246},
+    "15-20": {"win_rate": 0.528000, "avg_pnl": 167.930960},
+    "20-25": {"win_rate": 0.560000, "avg_pnl": 173.521867},
+    "25-30": {"win_rate": 0.380435, "avg_pnl": 17.961630},
+    "30-35": {"win_rate": 0.516129, "avg_pnl": 139.480430},
+    "35-40": {"win_rate": 0.516129, "avg_pnl": 57.921720},
+    "40-45": {"win_rate": 0.449275, "avg_pnl": -4.120145},
+    "45-50": {"win_rate": 0.597015, "avg_pnl": 218.478657},
+    "50-55": {"win_rate": 0.525424, "avg_pnl": -0.534237},
+    "55-60": {"win_rate": 0.410714, "avg_pnl": 44.394821},
+    "60-65": {"win_rate": 0.354839, "avg_pnl": 231.047097},
+    "65-70": {"win_rate": 0.555556, "avg_pnl": 118.667778},
+    "70-75": {"win_rate": 0.384615, "avg_pnl": 316.961538},
+    "75-80": {"win_rate": 0.416667, "avg_pnl": 315.670000},
+    "80-85": {"win_rate": 0.454545, "avg_pnl": 19.443636},
+    "85-90": {"win_rate": 0.000000, "avg_pnl": -407.400000},
     "90-100": {"win_rate": None, "avg_pnl": None},
-    "100+": {"win_rate": None, "avg_pnl": None},
 }
 
 SIG_STATS = {
-    "否": {"win_rate": 0.480055, "avg_pnl": 90.855681},
-    "是": {"win_rate": 0.443609, "avg_pnl": 15.681353},
+    "否": {"win_rate": 0.471761, "avg_pnl": 77.298992},
+    "是": {"win_rate": 0.470238, "avg_pnl": 60.151845},
+}
+
+# --- 新增：原始评分分段统计（每 5 分一段）
+# 用途：可用于对 raw_score 做二次修正（加/减分）或直接作为过滤依据。
+RAW_SCORE_SEG_STATS = {
+    "25-30": {"win_rate": 0.333333, "avg_pnl": -71.166667},
+    "30-35": {"win_rate": 0.200000, "avg_pnl": -110.898000},
+    "35-40": {"win_rate": 0.428571, "avg_pnl": 131.942143},
+    "40-45": {"win_rate": 0.356164, "avg_pnl": -69.951096},
+    "45-50": {"win_rate": 0.472222, "avg_pnl": 48.579722},
+    "50-55": {"win_rate": 0.432432, "avg_pnl": 11.099865},
+    "55-60": {"win_rate": 0.469136, "avg_pnl": 95.239074},
+    "60-65": {"win_rate": 0.490446, "avg_pnl": 113.576752},
+    "65-70": {"win_rate": 0.562500, "avg_pnl": 168.099125},
+    "70-75": {"win_rate": 0.594595, "avg_pnl": 301.978378},
+    "75-80": {"win_rate": 1.000000, "avg_pnl": 260.175000},
+    "85-90": {"win_rate": 1.000000, "avg_pnl": 169.310000},
 }
 
 # --- 新增：信号日涨幅(%) 分段统计
 # 档位：<=3.99, 4, 5, 6, 7, 8, 9<（保留 10+ 以防未来出现）
 SIG_UP_PCT_SEG_STATS = {
-    "<=3.99": {"win_rate": 0.489669, "avg_pnl": 86.430723},
-    "4": {"win_rate": 0.458716, "avg_pnl": 97.439266},
-    "5": {"win_rate": 0.413462, "avg_pnl": -30.966346},
-    "6": {"win_rate": 0.459459, "avg_pnl": 277.994324},
-    "7": {"win_rate": 0.625000, "avg_pnl": 78.337500},
-    "8": {"win_rate": 1.000000, "avg_pnl": 503.795000},
+    "<=3.99": {"win_rate": 0.486529, "avg_pnl": 73.034263},
+    "4": {"win_rate": 0.450000, "avg_pnl": 83.786269},
+    "5": {"win_rate": 0.418803, "avg_pnl": -30.072051},
+    "6": {"win_rate": 0.431818, "avg_pnl": 297.716591},
+    "7": {"win_rate": 0.625000, "avg_pnl": 60.473750},
+    "8": {"win_rate": 1.000000, "avg_pnl": 496.256667},
     "9<": {"win_rate": None, "avg_pnl": None},
     "10+": {"win_rate": None, "avg_pnl": None},
 }
@@ -296,15 +320,15 @@ SIG_UP_PCT_SEG_STATS = {
 # 档位：>=2, 3, 4, 5, 6, 7, 8, 9, 10+（保留 <=2 以防未来出现）
 SIG_VOL_RATIO_SEG_STATS = {
     "<=2": {"win_rate": None, "avg_pnl": None},
-    ">=2": {"win_rate": 0.449438, "avg_pnl": 101.329978},
-    "3": {"win_rate": 0.464912, "avg_pnl": 29.550307},
-    "4": {"win_rate": 0.566667, "avg_pnl": 123.392222},
-    "5": {"win_rate": 0.621622, "avg_pnl": 248.105405},
-    "6": {"win_rate": 0.571429, "avg_pnl": 25.779643},
-    "7": {"win_rate": 0.375000, "avg_pnl": -7.408125},
-    "8": {"win_rate": 0.000000, "avg_pnl": -246.790000},
-    "9": {"win_rate": 0.333333, "avg_pnl": 38.700000},
-    "10+": {"win_rate": 0.600000, "avg_pnl": 55.376000},
+    ">=2": {"win_rate": 0.451264, "avg_pnl": 85.306426},
+    "3": {"win_rate": 0.457447, "avg_pnl": 31.194716},
+    "4": {"win_rate": 0.548673, "avg_pnl": 97.808053},
+    "5": {"win_rate": 0.562500, "avg_pnl": 190.168125},
+    "6": {"win_rate": 0.575758, "avg_pnl": 60.816364},
+    "7": {"win_rate": 0.444444, "avg_pnl": 33.605556},
+    "8": {"win_rate": 0.333333, "avg_pnl": 304.853333},
+    "9": {"win_rate": 0.400000, "avg_pnl": 79.190000},
+    "10+": {"win_rate": 0.500000, "avg_pnl": -97.288333},
 }
 
 # 评分归一化：满分 100 分
