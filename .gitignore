@@ -9,3 +9,5 @@
 !wh/*.csv
 !autoTest/
 !autoTest/*
+!pc/
+!pc/*
