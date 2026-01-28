@@ -52,7 +52,7 @@ output_replay_compare_csv = false
 
 [manual]
 # 手动模式：跳过翻页扫描，直接用 strategy_ids
-use_manual_strategy_ids = true
+use_manual_strategy_ids = false
 strategy_ids = [440364, 398128, 436314, 303987, 297290, 435560]
 
 [replay]
