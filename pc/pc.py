@@ -4,7 +4,80 @@ import time
 from typing import Any, Dict
 from urllib.parse import quote
 
+from pathlib import Path
+
 import requests
+
+
+def _preview_value(v: Any, limit: int = 120) -> str:
+    s = str(v)
+    if len(s) > limit:
+        return s[:limit] + "..."
+    return s
+
+
+def _safe_float(v: Any) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _split_first_two(v: Any) -> tuple[Any, Any]:
+    if isinstance(v, list):
+        v0 = v[0] if len(v) > 0 else None
+        v1 = v[1] if len(v) > 1 else None
+        return v0, v1
+    return None, None
+
+
+def _parse_max_win_rate(max_win_rate: Any) -> tuple[Any, float | None, Any, float | None]:
+    mwr0, mwr1 = _split_first_two(max_win_rate)
+    mwr0_num = _parse_win_rate_ratio(mwr0)
+    mwr1_num = _safe_float(mwr1)
+    return mwr0, mwr0_num, mwr1, mwr1_num
+
+
+def _get_historypick_stocks(
+    historypick: Any,
+    *,
+    context: str,
+    sid: Any,
+    non_dict_verb: str,
+) -> Any:
+    stocks = None
+    if isinstance(historypick, dict):
+        hp_result = historypick.get("result")
+        if isinstance(hp_result, dict):
+            stocks = hp_result.get("stocks")
+        else:
+            preview = _preview_value(hp_result)
+            print(
+                f"{non_dict_verb}[{context}]：historypick.result 非 dict，sid={sid}，type={type(hp_result).__name__}，value={preview}"
+            )
+    return stocks
+
+
+def _derive_csv_filename(base: str, suffix: str) -> str:
+    if base.lower().endswith(".csv"):
+        return base[:-4] + suffix + ".csv"
+    return base + suffix + ".csv"
+
+
+def _write_dict_csv(path: str, rows: list[dict[str, Any]], *, fieldnames: list[str] | None = None) -> None:
+    import csv
+
+    if not rows:
+        return
+    fns = fieldnames or list(rows[0].keys())
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fns)
+        w.writeheader()
+        if fieldnames is None:
+            w.writerows(rows)
+        else:
+            for r in rows:
+                w.writerow({k: r.get(k) for k in fns})
 
 
 def _build_headers() -> Dict[str, str]:
@@ -150,6 +223,299 @@ def _parse_win_rate_ratio(v: Any) -> float | None:
     return None
 
 
+def _read_scanned_strategy_csv(csv_path: str) -> list[dict[str, Any]]:
+    import csv
+
+    rows: list[dict[str, Any]] = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            if not isinstance(r, dict):
+                continue
+            rows.append(r)
+    return rows
+
+
+def _load_config(config_path: str | None = None) -> dict[str, Any]:
+    """加载配置文件（默认同目录 pc_config.toml）。
+
+    支持：.toml（优先，支持注释） / .json
+    """
+    default_path = Path(__file__).with_name("pc_config.toml")
+    path = Path(config_path) if config_path else default_path
+
+    if not path.exists():
+        return {}
+
+    if path.suffix.lower() == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+        return obj if isinstance(obj, dict) else {}
+
+    # 默认按 toml 读取
+    try:
+        import tomllib  # py3.11+
+    except Exception:
+        return {}
+
+    try:
+        with open(path, "rb") as f:
+            obj = tomllib.load(f)
+    except Exception as e:
+        # 配置文件写错时不要直接崩溃：提示后回退到默认配置
+        print(f"[config] 解析失败，将忽略配置文件：{path} ({type(e).__name__}: {e})")
+        return {}
+
+    return obj if isinstance(obj, dict) else {}
+
+
+def _cfg_get(cfg: dict[str, Any], keys: list[str], default: Any) -> Any:
+    cur: Any = cfg
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur.get(k)
+    return cur
+
+
+def _replay_from_scanned_records(
+    session: requests.Session,
+    *,
+    scanned_records: list[dict[str, Any]],
+    trade_date: str,
+    mwr0_min: float,
+    mwr1_max: float,
+    skip_seen_strategy_ids: bool = True,
+    enable_list_winrate_prefilter: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """根据 scanned_strategy_ids.csv 的记录，重新跑一遍过滤逻辑，并输出用于对比的明细。"""
+    final_rows: list[dict[str, Any]] = []
+    compare_rows: list[dict[str, Any]] = []
+
+    seen_strategy_ids: set[int] = set()
+
+    for r in scanned_records:
+        sid_raw = r.get("strategy_id")
+        try:
+            sid = int(str(sid_raw).strip())
+        except Exception:
+            continue
+
+        if skip_seen_strategy_ids:
+            if sid in seen_strategy_ids:
+                continue
+            seen_strategy_ids.add(sid)
+
+        sort_type = r.get("sort_type")
+        page = r.get("page")
+        list_wr = r.get("list_winRate")
+        old_prefilter_pass = r.get("prefilter_pass")
+
+        list_wr_num = _parse_win_rate_ratio(list_wr)
+        new_prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
+
+        # scan 模式才有 list_winRate；manual 模式记录里为空，此时不做预过滤
+        if enable_list_winrate_prefilter and list_wr is not None and not new_prefilter_pass:
+            compare_rows.append(
+                {
+                    "strategy_id": sid,
+                    "sort_type": sort_type,
+                    "page": page,
+                    "list_winRate": list_wr,
+                    "old_prefilter_pass": old_prefilter_pass,
+                    "new_prefilter_pass": new_prefilter_pass,
+                    "replay_mwr0": None,
+                    "replay_mwr0_num": None,
+                    "replay_mwr1": None,
+                    "replay_mwr1_num": None,
+                    "replay_pass": False,
+                    "replay_reason": "prefilter_list_winRate",
+                }
+            )
+            continue
+
+        # 重新请求回测结果，按同样阈值过滤
+        backtestresult = fetch_backtestresult(session, sid)
+        max_win_rate = _get_max_win_rate(backtestresult)
+
+        mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
+        if mwr0_num is None or mwr0_num < mwr0_min:
+            compare_rows.append(
+                {
+                    "strategy_id": sid,
+                    "sort_type": sort_type,
+                    "page": page,
+                    "list_winRate": list_wr,
+                    "old_prefilter_pass": old_prefilter_pass,
+                    "new_prefilter_pass": new_prefilter_pass,
+                    "replay_mwr0": mwr0,
+                    "replay_mwr0_num": mwr0_num,
+                    "replay_mwr1": None,
+                    "replay_mwr1_num": None,
+                    "replay_pass": False,
+                    "replay_reason": "mwr0_min",
+                }
+            )
+            continue
+
+        if mwr1_num is None or mwr1_num > mwr1_max:
+            compare_rows.append(
+                {
+                    "strategy_id": sid,
+                    "sort_type": sort_type,
+                    "page": page,
+                    "list_winRate": list_wr,
+                    "old_prefilter_pass": old_prefilter_pass,
+                    "new_prefilter_pass": new_prefilter_pass,
+                    "replay_mwr0": mwr0,
+                    "replay_mwr0_num": mwr0_num,
+                    "replay_mwr1": mwr1,
+                    "replay_mwr1_num": mwr1_num,
+                    "replay_pass": False,
+                    "replay_reason": "mwr1_max",
+                }
+            )
+            continue
+
+        # 通过过滤：再补齐 detail/historypick 信息用于输出结果
+        detail = fetch_detail(session, sid)
+        result = detail.get("result", {}) if isinstance(detail, dict) else {}
+        qs = result.get("queryString", {}) if isinstance(result, dict) else {}
+        query = qs.get("query")
+        day_buy_stock_num = qs.get("dayBuyStockNum")
+
+        stock_map: dict[str, str] = {}
+        if query and day_buy_stock_num:
+            historypick = fetch_historypick(session, query=query, hold_num=day_buy_stock_num, trade_date=trade_date)
+            stocks = _get_historypick_stocks(historypick, context="replay", sid=sid, non_dict_verb="提示")
+            if stocks:
+                stock_map = _extract_mainboard_stock_map(stocks)
+
+        max_annual_yield = _get_max_annual_yield(backtestresult)
+
+        final_rows.append(
+            {
+                "sort_type": "replay",
+                "query": query,
+                "property_id": sid,
+                "trade_date": trade_date,
+                "dayBuyStockNum": day_buy_stock_num,
+                "fallIncome": result.get("fallIncome"),
+                "upperIncome": result.get("upperIncome"),
+                "lowerIncome": result.get("lowerIncome"),
+                "maxAnnualYield": max_annual_yield,
+                "maxWinRate": max_win_rate,
+                "mainboardStockMap": stock_map,
+            }
+        )
+
+        compare_rows.append(
+            {
+                "strategy_id": sid,
+                "sort_type": sort_type,
+                "page": page,
+                "list_winRate": list_wr,
+                "old_prefilter_pass": old_prefilter_pass,
+                "new_prefilter_pass": new_prefilter_pass,
+                "replay_mwr0": mwr0,
+                "replay_mwr0_num": mwr0_num,
+                "replay_mwr1": mwr1,
+                "replay_mwr1_num": mwr1_num,
+                "replay_pass": True,
+                "replay_reason": "pass",
+            }
+        )
+
+    return final_rows, compare_rows
+
+
+def _collect_rows_for_strategy_ids(
+    session: requests.Session,
+    *,
+    strategy_ids: list[int],
+    trade_date: str,
+    mwr0_min: float,
+    mwr1_max: float,
+    scanned_strategy_records: list[dict[str, Any]] | None = None,
+    seen_strategy_ids: set[int] | None = None,
+    skip_seen_strategy_ids: bool = True,
+) -> list[dict[str, Any]]:
+    final_rows: list[dict[str, Any]] = []
+
+    if seen_strategy_ids is None:
+        seen_strategy_ids = set()
+
+    for idx, sid in enumerate(strategy_ids, start=1):
+        try:
+            sid_int = int(sid)
+        except Exception:
+            continue
+
+        if skip_seen_strategy_ids:
+            if sid_int in seen_strategy_ids:
+                continue
+            seen_strategy_ids.add(sid_int)
+
+        if idx % 3 == 0:
+            print(f"进度[manual]: {idx}/{len(strategy_ids)} sid={sid_int}")
+
+        if scanned_strategy_records is not None:
+            scanned_strategy_records.append(
+                {
+                    "mode": "manual",
+                    "sort_type": "manual",
+                    "page": None,
+                    "strategy_id": sid_int,
+                    "list_winRate": None,
+                    "prefilter_pass": None,
+                }
+            )
+
+        detail = fetch_detail(session, sid_int)
+        result = detail.get("result", {}) if isinstance(detail, dict) else {}
+        qs = result.get("queryString", {}) if isinstance(result, dict) else {}
+
+        query = qs.get("query")
+        day_buy_stock_num = qs.get("dayBuyStockNum")
+
+        stock_map: dict[str, str] = {}
+        if query and day_buy_stock_num:
+            historypick = fetch_historypick(session, query=query, hold_num=day_buy_stock_num, trade_date=trade_date)
+            stocks = _get_historypick_stocks(historypick, context="manual", sid=sid, non_dict_verb="提示")
+            if stocks:
+                stock_map = _extract_mainboard_stock_map(stocks)
+
+        backtestresult = fetch_backtestresult(session, sid_int)
+        max_annual_yield = _get_max_annual_yield(backtestresult)
+        max_win_rate = _get_max_win_rate(backtestresult)
+
+        mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
+        if mwr0_num is None or mwr0_num < mwr0_min:
+            print(f"跳过[manual]：胜率不达标 sid={sid_int} mwr0={mwr0} min={mwr0_min:g}")
+            continue
+
+        if mwr1_num is None or mwr1_num > mwr1_max:
+            print(f"跳过[manual]：持股周期超限 sid={sid_int} mwr1={mwr1} max={mwr1_max:g}")
+            continue
+
+        merged: dict[str, Any] = {
+            "sort_type": "manual",
+            "query": query,
+            "property_id": sid_int,
+            "trade_date": trade_date,
+            "dayBuyStockNum": day_buy_stock_num,
+            "fallIncome": result.get("fallIncome"),
+            "upperIncome": result.get("upperIncome"),
+            "lowerIncome": result.get("lowerIncome"),
+            "maxAnnualYield": max_annual_yield,
+            "maxWinRate": max_win_rate,
+            "mainboardStockMap": stock_map,
+        }
+        final_rows.append(merged)
+
+    return final_rows
+
+
 def _collect_rows_for_sort(
     session: requests.Session,
     *,
@@ -161,13 +527,21 @@ def _collect_rows_for_sort(
     page_num: int,
     mwr0_min: float,
     mwr1_max: float,
+    scanned_strategy_records: list[dict[str, Any]] | None = None,
+    seen_strategy_ids: set[int] | None = None,
+    skip_seen_strategy_ids: bool = True,
+    enable_list_winrate_prefilter: bool = True,
 ) -> list[dict[str, Any]]:
     scanned_strategies = 0
     matched_filters = 0
     filtered_out_mainboard = 0
     filtered_out_mwr0 = 0
+    filtered_out_list_winrate = 0
 
     final_rows: list[dict[str, Any]] = []
+
+    if seen_strategy_ids is None:
+        seen_strategy_ids = set()
 
     page = 1
     while page <= max_pages and len(final_rows) < min_output_count:
@@ -185,7 +559,40 @@ def _collect_rows_for_sort(
             if sid is None:
                 continue
 
+            try:
+                sid_int = int(sid)
+            except Exception:
+                continue
+
+            # 去重：同一个策略如果之前查询过（跨页/跨 sort_type），直接跳过
+            if skip_seen_strategy_ids:
+                if sid_int in seen_strategy_ids:
+                    continue
+                seen_strategy_ids.add(sid_int)
+
             scanned_strategies += 1
+
+            # 预过滤：先用列表页自带的 winRate 做一次过滤，减少后续 detail/backtestresult/historypick 请求
+            list_wr = prop.get("winRate")
+            list_wr_num = _parse_win_rate_ratio(list_wr)
+
+            prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
+            if scanned_strategy_records is not None:
+                scanned_strategy_records.append(
+                    {
+                        "mode": "scan",
+                        "sort_type": sort_type,
+                        "page": page,
+                        "strategy_id": sid_int,
+                        "list_winRate": list_wr,
+                        "prefilter_pass": prefilter_pass,
+                    }
+                )
+
+            if enable_list_winrate_prefilter:
+                if not prefilter_pass:
+                    filtered_out_list_winrate += 1
+                    continue
 
             if scanned_strategies % 5 == 0:
                 print(
@@ -194,7 +601,7 @@ def _collect_rows_for_sort(
                     f"已收集输出={len(final_rows)}/{min_output_count}"
                 )
 
-            detail = fetch_detail(session, int(sid))
+            detail = fetch_detail(session, sid_int)
             result = detail.get("result", {}) if isinstance(detail, dict) else {}
             qs = result.get("queryString", {}) if isinstance(result, dict) else {}
 
@@ -205,18 +612,7 @@ def _collect_rows_for_sort(
 
             historypick = fetch_historypick(session, query=query, hold_num=day_buy_stock_num, trade_date=trade_date)
 
-            stocks = None
-            if isinstance(historypick, dict):
-                hp_result = historypick.get("result")
-                if isinstance(hp_result, dict):
-                    stocks = hp_result.get("stocks")
-                else:
-                    preview = str(hp_result)
-                    if len(preview) > 120:
-                        preview = preview[:120] + "..."
-                    print(
-                        f"跳过[{sort_type}]：historypick.result 非 dict，sid={sid}，type={type(hp_result).__name__}，value={preview}"
-                    )
+            stocks = _get_historypick_stocks(historypick, context=str(sort_type), sid=sid, non_dict_verb="跳过")
 
             if not stocks:
                 continue
@@ -226,21 +622,15 @@ def _collect_rows_for_sort(
                 filtered_out_mainboard += 1
                 continue
 
-            backtestresult = fetch_backtestresult(session, int(sid))
+            backtestresult = fetch_backtestresult(session, sid_int)
             max_annual_yield = _get_max_annual_yield(backtestresult)
             max_win_rate = _get_max_win_rate(backtestresult)
 
-            mwr0 = max_win_rate[0] if isinstance(max_win_rate, list) and len(max_win_rate) > 0 else None
-            mwr0_num = _parse_win_rate_ratio(mwr0)
+            mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
             if mwr0_num is None or mwr0_num < mwr0_min:
                 filtered_out_mwr0 += 1
                 continue
 
-            mwr1 = max_win_rate[1] if isinstance(max_win_rate, list) and len(max_win_rate) > 1 else None
-            try:
-                mwr1_num = float(mwr1) if mwr1 is not None else None
-            except Exception:
-                mwr1_num = None
             if mwr1_num is None or mwr1_num > mwr1_max:
                 continue
 
@@ -249,7 +639,7 @@ def _collect_rows_for_sort(
             merged = dict(historypick)
             merged["sort_type"] = sort_type
             merged["query"] = query
-            merged["property_id"] = sid
+            merged["property_id"] = sid_int
             merged["trade_date"] = trade_date
             merged["dayBuyStockNum"] = day_buy_stock_num
             merged["fallIncome"] = result.get("fallIncome")
@@ -271,7 +661,7 @@ def _collect_rows_for_sort(
 
     print(
         f"汇总[{sort_type}]: 已扫描策略={scanned_strategies}, mwr0>={mwr0_min:g} 且 mwr1<={mwr1_max:g} 命中={matched_filters}, "
-        f"胜率过滤剔除={filtered_out_mwr0}, 主板过滤剔除={filtered_out_mainboard}, "
+        f"列表胜率预过滤剔除={filtered_out_list_winrate}, 胜率过滤剔除={filtered_out_mwr0}, 主板过滤剔除={filtered_out_mainboard}, "
         f"最终输出={len(final_rows)} (目标 min_count={min_output_count})"
     )
 
@@ -283,45 +673,68 @@ def _collect_rows_for_sort(
 
 def main(
     *,
-    # trade_date: str | None = None,
-    trade_date: str | None = "2026-01-23",
+    trade_date: str | None = None,
+    # trade_date: str | None = "2026-01-27",
     min_count: int = 5,
     max_pages: int = 100,
     page_num: int = 10,
     # gain(本月), winRate(成功率), profit(年化收益), hot(热度)
-    # sort_types: list[str] | None = None,
-    sort_types: list[str] | None = ["winRate"],
+    sort_types: list[str] | None = None,
+    # sort_types: list[str] | None = ["winRate"],
     keyword: str = "",
 ) -> None:
     # =============================
-    # 可配置参数（集中放这里，方便修改）
+    # 配置优先：读取 pc_config.toml（同目录）
     # =============================
+    cfg = _load_config()
+
+    cfg_trade_date = _cfg_get(cfg, ["run", "trade_date"], trade_date)
+    if not cfg_trade_date:
+        cfg_trade_date = None
+    trade_date = cfg_trade_date
+
+    cfg_min_count = _cfg_get(cfg, ["run", "min_count"], min_count)
+    cfg_max_pages = _cfg_get(cfg, ["run", "max_pages"], max_pages)
+    cfg_page_num = _cfg_get(cfg, ["run", "page_num"], page_num)
+
+    sort_types_cfg = _cfg_get(cfg, ["run", "sort_types"], sort_types)
+    keyword_cfg = _cfg_get(cfg, ["run", "keyword"], keyword)
+
+    mwr0_min_cfg = _cfg_get(cfg, ["filters", "mwr0_min"], 0.8)
+    mwr1_max_cfg = _cfg_get(cfg, ["filters", "mwr1_max"], 5.0)
+    enable_list_winrate_prefilter = bool(_cfg_get(cfg, ["filters", "enable_list_winrate_prefilter"], True))
+    skip_seen_strategy_ids = bool(_cfg_get(cfg, ["filters", "skip_seen_strategy_ids"], True))
+
+    expand_stocks = bool(_cfg_get(cfg, ["output", "expand_stocks"], False))
+    output_scanned_strategy_ids_csv = bool(_cfg_get(cfg, ["output", "output_scanned_strategy_ids_csv"], False))
+    output_replay_compare_csv = bool(_cfg_get(cfg, ["output", "output_replay_compare_csv"], False))
+
+    replay_from_scanned_csv_path = str(_cfg_get(cfg, ["replay", "from_scanned_csv_path"], "") or "").strip()
+    replay_from_scanned_csv_path = replay_from_scanned_csv_path or None
+
+    use_manual_strategy_ids = bool(_cfg_get(cfg, ["manual", "use_manual_strategy_ids"], False))
+    manual_strategy_ids = _cfg_get(cfg, ["manual", "strategy_ids"], [])
+    if not isinstance(manual_strategy_ids, list):
+        manual_strategy_ids = []
+
     # 交易日（None 表示当天）
     if trade_date is None:
         trade_date = time.strftime("%Y-%m-%d")
 
-    # 需要最少输出多少条“符合要求”的策略
-    MIN_OUTPUT_COUNT = int(min_count)
+    MIN_OUTPUT_COUNT = int(cfg_min_count)
+    MAX_PAGES = int(cfg_max_pages)
+    PAGE_NUM = int(cfg_page_num)
 
-    # 最大翻页数
-    MAX_PAGES = int(max_pages)
+    MWR1_MAX = float(mwr1_max_cfg)
+    MWR0_MIN = float(mwr0_min_cfg)
 
-    # 每页拉取策略数量
-    PAGE_NUM = int(page_num)
-
-    # 筛选阈值：只保留 maxWinRate 的持股周期（mwr1）<= 该值
-    MWR1_MAX = 5.0
-
-    # 筛选阈值：只保留最大胜率（mwr0）>= 该值
-    MWR0_MIN = 0.8
-
-    # 输出 CSV：按当前日期时间命名
     OUTPUT_CSV_FILENAME = time.strftime("%Y%m%d_%H%M%S") + ".csv"
-
-    # 是否将“入选股票”展开为单独列（否则为一个 JSON 字符串列）
-    EXPAND_STOCKS = False
-
-    # =============================
+    EXPAND_STOCKS = expand_stocks
+    OUTPUT_SCANNED_STRATEGY_IDS_CSV = output_scanned_strategy_ids_csv
+    REPLAY_FROM_SCANNED_CSV_PATH = replay_from_scanned_csv_path
+    OUTPUT_REPLAY_COMPARE_CSV = output_replay_compare_csv
+    USE_MANUAL_STRATEGY_IDS = use_manual_strategy_ids
+    MANUAL_STRATEGY_IDS: list[int] = [int(x) for x in manual_strategy_ids if str(x).strip().isdigit()]
 
     with requests.Session() as session:
         session.headers.update(_build_headers())
@@ -333,27 +746,57 @@ def main(
             pass
         _human_sleep(1.0, 2.8)
 
-        effective_sort_types = sort_types or ["gain", "winRate", "profit", "hot"]
-
         final_rows: list[dict[str, Any]] = []
-        for st in effective_sort_types:
-            rows = _collect_rows_for_sort(
+        scanned_strategy_records: list[dict[str, Any]] = []
+        replay_compare_rows: list[dict[str, Any]] = []
+        seen_strategy_ids: set[int] = set()
+        if REPLAY_FROM_SCANNED_CSV_PATH:
+            scanned_records = _read_scanned_strategy_csv(REPLAY_FROM_SCANNED_CSV_PATH)
+            final_rows, replay_compare_rows = _replay_from_scanned_records(
                 session,
-                sort_type=st,
-                keyword=keyword,
+                scanned_records=scanned_records,
                 trade_date=trade_date,
-                min_output_count=MIN_OUTPUT_COUNT,
-                max_pages=MAX_PAGES,
-                page_num=PAGE_NUM,
                 mwr0_min=MWR0_MIN,
                 mwr1_max=MWR1_MAX,
+                skip_seen_strategy_ids=skip_seen_strategy_ids,
+                enable_list_winrate_prefilter=enable_list_winrate_prefilter,
             )
-            final_rows.extend(rows)
+        else:
+            strategy_ids = MANUAL_STRATEGY_IDS if USE_MANUAL_STRATEGY_IDS else None
+            if strategy_ids:
+                final_rows = _collect_rows_for_strategy_ids(
+                    session,
+                    strategy_ids=strategy_ids,
+                    trade_date=trade_date,
+                    mwr0_min=MWR0_MIN,
+                    mwr1_max=MWR1_MAX,
+                    scanned_strategy_records=scanned_strategy_records,
+                    seen_strategy_ids=seen_strategy_ids,
+                    skip_seen_strategy_ids=skip_seen_strategy_ids,
+                )
+            else:
+                effective_sort_types = sort_types_cfg or sort_types or ["winRate","gain", "profit", "hot"]
+                for st in effective_sort_types:
+                    rows = _collect_rows_for_sort(
+                        session,
+                        sort_type=st,
+                        keyword=str(keyword_cfg or ""),
+                        trade_date=trade_date,
+                        min_output_count=MIN_OUTPUT_COUNT,
+                        max_pages=MAX_PAGES,
+                        page_num=PAGE_NUM,
+                        mwr0_min=MWR0_MIN,
+                        mwr1_max=MWR1_MAX,
+                        scanned_strategy_records=scanned_strategy_records,
+                        seen_strategy_ids=seen_strategy_ids,
+                        skip_seen_strategy_ids=skip_seen_strategy_ids,
+                        enable_list_winrate_prefilter=enable_list_winrate_prefilter,
+                    )
+                    final_rows.extend(rows)
 
         # =============================
         # 输出：控制台 + CSV
         # =============================
-        import csv
         import os
 
         # 整理为可写入 CSV 的结构（final_rows 已是最终口径）
@@ -371,14 +814,11 @@ def main(
             mwr = r.get("maxWinRate")
 
             stock_map = r.get("mainboardStockMap") if isinstance(r, dict) else None
-            if not isinstance(stock_map, dict) or not stock_map:
-                # 理论上不会发生（已前置过滤），兜底避免 KeyError
-                continue
+            if not isinstance(stock_map, dict):
+                stock_map = {}
 
-            may0 = may[0] if isinstance(may, list) and len(may) > 0 else None
-            may1 = may[1] if isinstance(may, list) and len(may) > 1 else None
-            mwr0 = mwr[0] if isinstance(mwr, list) and len(mwr) > 0 else None
-            mwr1 = mwr[1] if isinstance(mwr, list) and len(mwr) > 1 else None
+            may0, may1 = _split_first_two(may)
+            mwr0, _, mwr1, _ = _parse_max_win_rate(mwr)
 
             # 控制台输出
             print(f"策略：{q}")
@@ -423,12 +863,37 @@ def main(
         # 写 CSV
         if csv_rows:
             out_path = os.path.join(os.getcwd(), OUTPUT_CSV_FILENAME)
-            fieldnames = list(csv_rows[0].keys())
-            with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=fieldnames)
-                w.writeheader()
-                w.writerows(csv_rows)
+            _write_dict_csv(out_path, csv_rows)
             print(f"CSV 已输出: {out_path}")
+
+            if OUTPUT_SCANNED_STRATEGY_IDS_CSV and scanned_strategy_records:
+                scanned_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_scanned_strategy_ids")
+                scanned_path = os.path.join(os.getcwd(), scanned_filename)
+
+                scanned_fieldnames = ["mode", "sort_type", "page", "strategy_id", "list_winRate", "prefilter_pass"]
+                _write_dict_csv(scanned_path, scanned_strategy_records, fieldnames=scanned_fieldnames)
+                print(f"扫描到的 strategy_id 列表已输出: {scanned_path}")
+
+            if OUTPUT_REPLAY_COMPARE_CSV and replay_compare_rows:
+                replay_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_replay_compare")
+                replay_path = os.path.join(os.getcwd(), replay_filename)
+
+                replay_fieldnames = [
+                    "strategy_id",
+                    "sort_type",
+                    "page",
+                    "list_winRate",
+                    "old_prefilter_pass",
+                    "new_prefilter_pass",
+                    "replay_mwr0",
+                    "replay_mwr0_num",
+                    "replay_mwr1",
+                    "replay_mwr1_num",
+                    "replay_pass",
+                    "replay_reason",
+                ]
+                _write_dict_csv(replay_path, replay_compare_rows, fieldnames=replay_fieldnames)
+                print(f"回放对比表已输出: {replay_path}")
 
             # 统计：每只股票出现次数（按 sort_type 去重：同一 sort_type 内只算一次）
             from collections import defaultdict
@@ -473,18 +938,11 @@ def main(
 
             stock_count_rows.sort(key=lambda r: (-int(r.get("count") or 0), str(r.get("stock_code") or "")))
 
-            counts_filename = OUTPUT_CSV_FILENAME
-            if counts_filename.lower().endswith(".csv"):
-                counts_filename = counts_filename[:-4] + "_stock_counts.csv"
-            else:
-                counts_filename = counts_filename + "_stock_counts.csv"
+            counts_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_stock_counts")
             counts_path = os.path.join(os.getcwd(), counts_filename)
 
             if stock_count_rows:
-                with open(counts_path, "w", newline="", encoding="utf-8-sig") as f:
-                    w = csv.DictWriter(f, fieldnames=["stock_code", "stock_name", "count", "sort_types"])
-                    w.writeheader()
-                    w.writerows(stock_count_rows)
+                _write_dict_csv(counts_path, stock_count_rows, fieldnames=["stock_code", "stock_name", "count", "sort_types"])
                 print(f"股票出现次数统计已输出: {counts_path}")
             else:
                 print("股票出现次数统计为空：没有解析到 stocks")
