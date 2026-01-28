@@ -80,6 +80,13 @@ def _write_dict_csv(path: str, rows: list[dict[str, Any]], *, fieldnames: list[s
                 w.writerow({k: r.get(k) for k in fns})
 
 
+def _get_csv_output_dir() -> Path:
+    """返回当前工作目录下的 csv 输出目录，并确保其存在。"""
+    out_dir = Path.cwd() / "csv"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
 def _build_headers() -> Dict[str, str]:
     # 尽量模拟常见浏览器请求头（不保证能绕过风控，仅用于降低“过于像脚本”的特征）
     return {
@@ -862,13 +869,14 @@ def main(
 
         # 写 CSV
         if csv_rows:
-            out_path = os.path.join(os.getcwd(), OUTPUT_CSV_FILENAME)
+            out_dir = _get_csv_output_dir()
+            out_path = str(out_dir / OUTPUT_CSV_FILENAME)
             _write_dict_csv(out_path, csv_rows)
             print(f"CSV 已输出: {out_path}")
 
             if OUTPUT_SCANNED_STRATEGY_IDS_CSV and scanned_strategy_records:
                 scanned_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_scanned_strategy_ids")
-                scanned_path = os.path.join(os.getcwd(), scanned_filename)
+                scanned_path = str(out_dir / scanned_filename)
 
                 scanned_fieldnames = ["mode", "sort_type", "page", "strategy_id", "list_winRate", "prefilter_pass"]
                 _write_dict_csv(scanned_path, scanned_strategy_records, fieldnames=scanned_fieldnames)
@@ -876,7 +884,7 @@ def main(
 
             if OUTPUT_REPLAY_COMPARE_CSV and replay_compare_rows:
                 replay_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_replay_compare")
-                replay_path = os.path.join(os.getcwd(), replay_filename)
+                replay_path = str(out_dir / replay_filename)
 
                 replay_fieldnames = [
                     "strategy_id",
@@ -939,7 +947,7 @@ def main(
             stock_count_rows.sort(key=lambda r: (-int(r.get("count") or 0), str(r.get("stock_code") or "")))
 
             counts_filename = _derive_csv_filename(OUTPUT_CSV_FILENAME, "_stock_counts")
-            counts_path = os.path.join(os.getcwd(), counts_filename)
+            counts_path = str(out_dir / counts_filename)
 
             if stock_count_rows:
                 _write_dict_csv(counts_path, stock_count_rows, fieldnames=["stock_code", "stock_name", "count", "sort_types"])

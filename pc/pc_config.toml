@@ -6,7 +6,7 @@
 trade_date = "2026-01-27"
 
 # 每个 sort_type 需要最少输出多少条“符合要求”的策略
-min_count = 5
+min_count = 1
 
 # 最大翻页数
 max_pages = 200
@@ -16,7 +16,7 @@ page_num = 10
 
 # sort_types 为空表示使用 ["gain","winRate","profit","hot"]
 # 可选："gain"(本月) "winRate"(成功率) "profit"(年化收益) "hot"(热度)
-sort_types = []
+sort_types = ["profit"]
 
 # 关键词搜索（可留空）
 keyword = ""
