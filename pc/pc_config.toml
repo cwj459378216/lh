@@ -1,0 +1,61 @@
+# pc.py 配置文件（TOML）
+# 说明：保持默认值即可运行；按需修改。
+
+[run]
+# 交易日：
+# - "YYYY-MM-DD"：指定日期
+# - 留空：使用当天
+# - "yesterday"（或 "prev" / "-1"）：使用当天的前一天
+trade_date = "yesterday"
+
+# 每个 sort_type 需要最少输出多少条“符合要求”的策略
+min_count = 3
+
+# 最大翻页数
+max_pages = 300
+
+# 每页数量
+page_num = 10
+
+# sort_types 为空表示使用 ["gain","winRate","profit","hot"]
+# 可选："gain"(本月) "winRate"(成功率) "profit"(年化收益) "hot"(热度)
+sort_types = []
+
+# 关键词搜索（可留空）
+keyword = ""
+
+[filters]
+# 胜率阈值：mwr0 >= 该值
+mwr0_min = 0.8
+
+# 持股周期阈值：mwr1 <= 该值
+mwr1_max = 5.0
+
+# 是否启用列表页 winRate 预过滤（在 fetch_detail 之前过滤）
+enable_list_winrate_prefilter = true
+
+# 是否启用 strategy_id 去重（之前查询过的策略跳过）
+skip_seen_strategy_ids = true
+
+# query 内容相似度过滤阈值（0~1）。默认 0.70；设为 0 表示关闭。
+query_similarity_threshold = 0.70
+
+[output]
+# 是否将“入选股票”展开为多列（否则写入 stocks JSON 字符串）
+expand_stocks = false
+
+# 是否额外输出所有扫描/查询过的 strategy_id CSV
+output_scanned_strategy_ids_csv = true
+
+# 回放模式对比表（replay_compare）是否输出
+output_replay_compare_csv = false
+
+[manual]
+# 手动模式：跳过翻页扫描，直接用 strategy_ids
+use_manual_strategy_ids = false
+strategy_ids = [440364, 398128, 436314, 303987, 297290, 435560]
+
+[replay]
+# 回放模式：读取已导出的 *_scanned_strategy_ids.csv，再重新筛选一遍（用于对比）
+# 留空表示关闭。示例："/Users/frank/work/code/lh/lh/pc/20260128_101010_scanned_strategy_ids.csv"
+from_scanned_csv_path = ""

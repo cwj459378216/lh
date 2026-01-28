@@ -4,6 +4,7 @@
 1) 运行 update_realtime_snapshot.py 更新当日实时数据，并打印更新统计
 2) 运行 select_stocks_local.py 筛选当日符合条件的股票，并打印选股结果（前 N 行）
 3) 运行 update_stop_loss_table.py 更新 output/选股维护表单.csv 的平仓信息，并打印“当日平仓”明细
+4) 运行 pc/pc.py 根据在线策略选股（输出 pc/csv 下的结果 CSV）
 
 用法示例：
   # 不传 --signal-date/--end-date 时，默认使用“当天”日期
@@ -15,6 +16,7 @@
     # 指定只跑某个流程
     python run_daily_workflow.py --flow stoploss
     python run_daily_workflow.py --flow select
+    python run_daily_workflow.py --flow pc
 
     # 跳过 update_realtime_snapshot（直接用现有数据继续跑后续步骤）
     python run_daily_workflow.py --flow stoploss --skip-snapshot
@@ -27,9 +29,10 @@
 - 本脚本通过子进程调用现有脚本，尽量不侵入原逻辑。
 - “当日平仓”定义：在选股维护表单中，平仓日期 == end-date 且 是否平仓 == 是。
 
-新增：支持拆分为两个“定时子流程”
+新增：支持拆分为三个“定时子流程”
 - flow=stoploss: update_realtime_snapshot -> update_stop_loss_table
 - flow=select:   update_realtime_snapshot -> select_stocks_local
+- flow=pc:       pc/pc.py 在线策略选股
 - flow=test:     仅发送测试通知
 
 每个流程结束后（成功/失败）都会发送企业微信通知（若配置了 webhook）。
@@ -169,6 +172,95 @@ def _send_wecom_text(webhook_url: str, content: str, timeout: int = 10) -> tuple
         return None, body
 
 
+def _find_latest_csv_under(dir_path: str, suffix: str = ".csv") -> str | None:
+    """Find latest csv file under directory (non-recursive)."""
+    try:
+        if not os.path.isdir(dir_path):
+            return None
+        cands = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.lower().endswith(suffix)]
+        if not cands:
+            return None
+        return max(cands, key=lambda p: os.path.getmtime(p))
+    except Exception:
+        return None
+
+
+def _find_latest_stock_counts_csv(pc_csv_dir: str) -> str | None:
+    """Find latest *_stock_counts.csv under pc/csv (non-recursive)."""
+    try:
+        if not os.path.isdir(pc_csv_dir):
+            return None
+        cands = [
+            os.path.join(pc_csv_dir, f)
+            for f in os.listdir(pc_csv_dir)
+            if f.lower().endswith("_stock_counts.csv")
+        ]
+        if not cands:
+            return None
+        return max(cands, key=lambda p: os.path.getmtime(p))
+    except Exception:
+        return None
+
+
+def _append_stock_counts_preview_to_msg(
+    msg_lines: list[str],
+    *,
+    stock_counts_csv: str,
+    root_dir: str,
+    top_n: int = 30,
+) -> None:
+    """Append top-N rows of stock_counts csv into msg_lines.
+
+    Keep the message compact: one stock per line.
+    """
+    if not stock_counts_csv or (not os.path.exists(stock_counts_csv)):
+        return
+
+    try:
+        df = _read_csv_smart(stock_counts_csv)
+    except Exception as e:
+        msg_lines.append(f"pc: stock_counts read fail: {e}")
+        return
+
+    if df is None or df.empty:
+        rel = os.path.relpath(stock_counts_csv, root_dir)
+        msg_lines.append(f"pc: stock_counts empty ({rel})")
+        return
+
+    rel = os.path.relpath(stock_counts_csv, root_dir)
+    msg_lines.append(f"pc: stock_counts top{int(top_n)} ({rel})")
+
+    df_send = df.copy().head(int(top_n))
+
+    # Try to pick sensible columns if present
+    col_code = next((c for c in ["stock_code", "code", "股票代码"] if c in df_send.columns), None)
+    col_name = next((c for c in ["stock_name", "name", "股票名称"] if c in df_send.columns), None)
+    col_cnt = next((c for c in ["count", "出现次数", "次数"] if c in df_send.columns), None)
+    col_sort_types = next((c for c in ["sort_types", "来源", "sortType"] if c in df_send.columns), None)
+
+    for _, r in df_send.iterrows():
+        parts: list[str] = []
+        if col_code:
+            v = str(r.get(col_code, "")).strip()
+            if v:
+                parts.append(v)
+        if col_name:
+            v = str(r.get(col_name, "")).strip()
+            if v:
+                parts.append(v)
+        if col_cnt:
+            v = str(r.get(col_cnt, "")).strip()
+            if v:
+                parts.append(f"x{v}")
+        if col_sort_types:
+            v = str(r.get(col_sort_types, "")).strip()
+            if v:
+                parts.append(v)
+
+        if parts:
+            msg_lines.append(" ".join(parts))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--signal-date", required=False, default=date.today().strftime("%Y%m%d"), help="选股信号日 YYYYMMDD")
@@ -182,9 +274,9 @@ def main() -> int:
 
     parser.add_argument(
         "--flow",
-        choices=["stoploss", "select", "full", "test"],
+        choices=["stoploss", "select", "pc", "full", "test"],
         default="full",
-        help="执行流程：stoploss(快照->止损表) / select(快照->选股) / full(原完整流程) / test(仅发通知)",
+        help="执行流程：stoploss(快照->止损表) / select(快照->选股) / pc(在线策略选股) / full(原完整流程) / test(仅发通知)",
     )
 
     parser.add_argument("--selection-form", default=os.path.join(ROOT, "output", "选股维护表单.csv"), help="选股维护表单路径")
@@ -222,20 +314,23 @@ def main() -> int:
             msg_lines.append("[TEST] notify-only")
             return 0
 
-        # 1) 更新实时快照（可按需跳过）
-        if skip_snapshot:
-            print("1. 跳过 update_realtime_snapshot（--skip-snapshot）")
-            msg_lines.append("1. skip update_realtime_snapshot (--skip-snapshot)")
-        else:
-            rc1, out1 = _run_capture([sys.executable, os.path.join(ROOT, "update_realtime_snapshot.py")], cwd=ROOT)
-            if rc1 != 0:
-                raise subprocess.CalledProcessError(rc1, [sys.executable, os.path.join(ROOT, "update_realtime_snapshot.py")])
+        # 对 pc 流程：不依赖 update_realtime_snapshot，可按需跳过
 
-            snap_summary = _extract_snapshot_summary(out1)
-            if snap_summary:
-                line1 = "1. " + snap_summary
-                print(line1)
-                msg_lines.append(line1)
+        # 1) 更新实时快照（可按需跳过）
+        if flow != "pc":
+            if skip_snapshot:
+                print("1. 跳过 update_realtime_snapshot（--skip-snapshot）")
+                msg_lines.append("1. skip update_realtime_snapshot (--skip-snapshot)")
+            else:
+                rc1, out1 = _run_capture([sys.executable, os.path.join(ROOT, "update_realtime_snapshot.py")], cwd=ROOT)
+                if rc1 != 0:
+                    raise subprocess.CalledProcessError(rc1, [sys.executable, os.path.join(ROOT, "update_realtime_snapshot.py")])
+
+                snap_summary = _extract_snapshot_summary(out1)
+                if snap_summary:
+                    line1 = "1. " + snap_summary
+                    print(line1)
+                    msg_lines.append(line1)
 
         # 2) 选股（flow=select/full）
         if flow in ("select", "full"):
@@ -351,6 +446,40 @@ def main() -> int:
                                 msg_lines.append(s)
 
                     _print_df(df_closed, f"当日平仓股票(end-date={end_date})", max_rows=int(args.print_closed))
+
+        # 4) 在线策略选股（flow=pc）
+        if flow == "pc":
+            pc_dir = os.path.join(ROOT, "pc")
+            pc_py = os.path.join(pc_dir, "pc.py")
+
+            if not os.path.exists(pc_py):
+                raise FileNotFoundError(f"pc.py 不存在: {pc_py}")
+
+            # 直接执行：配置由 pc/pc_config.toml 控制
+            pc_cmd = [sys.executable, pc_py]
+            _run(pc_cmd, cwd=pc_dir)
+
+            # 尝试找到最新输出的 CSV（pc/csv 下）
+            pc_csv_dir = os.path.join(pc_dir, "csv")
+
+            latest_stock_counts = _find_latest_stock_counts_csv(pc_csv_dir)
+            if latest_stock_counts:
+                _append_stock_counts_preview_to_msg(
+                    msg_lines,
+                    stock_counts_csv=latest_stock_counts,
+                    root_dir=ROOT,
+                    top_n=30,
+                )
+            else:
+                msg_lines.append("pc: stock_counts not found")
+
+            latest_pc_csv = _find_latest_csv_under(pc_csv_dir)
+            if latest_pc_csv:
+                rel = os.path.relpath(latest_pc_csv, ROOT)
+                msg_lines.append(f"pc: CSV={rel}")
+                print(f"[pc] latest csv: {latest_pc_csv}")
+            else:
+                msg_lines.append("pc: done (no csv found)")
 
     except Exception as e:
         status = "FAIL"
