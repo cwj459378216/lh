@@ -46,6 +46,10 @@ import subprocess
 import sys
 from datetime import date
 from datetime import datetime
+import re
+import time
+import ast
+from collections import Counter
 
 import json
 import pandas as pd
@@ -122,6 +126,81 @@ def _extract_snapshot_summary(output: str) -> str:
         if s.startswith("更新完成"):
             return s
     return ""
+
+
+def _parse_and_send_individual_strategies(output: str, webhook: str) -> tuple[int, Counter]:
+    """解析 pc.py 输出，提取策略块。若最新胜率 > 60，则单独发送一条通知。
+    返回 (发送条数, 股票统计Counter)。
+    """
+    stats = Counter()
+    if not output or not webhook:
+        return 0, stats
+
+    # 用于过滤非策略信息的行（如 [Override] 日志等）
+    valid_prefixes = (
+        "策略：", "策略ID：", "策略地址：", "排序方式: ", "交易日: ", "单日买入数: ",
+        "止盈: ", "止损: ", "最大预期: ", "最大胜率: ", "最新胜率: ", "入选股票："
+    )
+
+    # pc.py 输出的策略分隔符
+    separator = "-" * 60
+    # 切分
+    chunks = output.split(separator)
+    
+    sent_count = 0
+    for chunk in chunks:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        
+        # 简单校验：必须包含策略ID行
+        if "策略ID：" not in chunk:
+            continue
+
+        # 过滤杂质，只保留策略字段行，同时寻找“入选股票”行
+        lines_to_send = []
+        stock_map_str = ""
+
+        for line in chunk.splitlines():
+            s = line.strip()
+            if s.startswith(valid_prefixes):
+                lines_to_send.append(s)
+            if s.startswith("入选股票："):
+                stock_map_str = s.replace("入选股票：", "", 1).strip()
+        
+        if not lines_to_send:
+            continue
+
+        clean_chunk = "\n".join(lines_to_send)
+            
+        # 提取胜率
+        # 格式示例: "最新胜率: 胜率 90.00%, 最新的回测持股周期 1 天"
+        # 正则提取 "最新胜率: 胜率 " 后面的数字
+        match = re.search(r"最新胜率:\s*胜率\s*([\d\.]+)", clean_chunk)
+        if match:
+            try:
+                val = float(match.group(1))
+                if val > 60.0:
+                    # 解析股票并统计
+                    if stock_map_str:
+                        try:
+                            # stock_map 是类似 {'600xxx': 'Name'} 的字符串
+                            s_map = ast.literal_eval(stock_map_str)
+                            if isinstance(s_map, dict):
+                                for code, name in s_map.items():
+                                    stats[(code, name)] += 1
+                        except Exception:
+                            pass
+
+                    # 单独发送清洗后的策略文本
+                    _send_wecom_text(webhook, clean_chunk)
+                    sent_count += 1
+                    # 避免瞬间请求过多触发限制
+                    time.sleep(0.5)
+            except Exception:
+                pass
+                
+    return sent_count, stats
 
 
 def _now_str() -> str:
@@ -457,21 +536,38 @@ def main() -> int:
 
             # 直接执行：配置由 pc/pc_config.toml 控制
             pc_cmd = [sys.executable, pc_py]
-            _run(pc_cmd, cwd=pc_dir)
+            
+            # 运行并捕获输出
+            rc, out = _run_capture(pc_cmd, cwd=pc_dir)
+            if rc != 0:
+                raise subprocess.CalledProcessError(rc, pc_cmd, output=out)
+
+            # 逐条发送高胜率策略(>60%)
+            if wecom_webhook:
+                sent_n, stock_stats = _parse_and_send_individual_strategies(out, wecom_webhook)
+                if sent_n > 0:
+                    msg_lines.append(f"pc: sent {sent_n} high-win-rate strategies")
+                    if stock_stats:
+                        msg_lines.append("=== 推荐汇总 ===")
+                        # 按出现次数倒序
+                        for (code, name), count in stock_stats.most_common():
+                            msg_lines.append(f"{code} {name} x{count}")
+                else:
+                    msg_lines.append("pc: no strategies met condition (>60%)")
 
             # 尝试找到最新输出的 CSV（pc/csv 下）
             pc_csv_dir = os.path.join(pc_dir, "csv")
 
-            latest_stock_counts = _find_latest_stock_counts_csv(pc_csv_dir)
-            if latest_stock_counts:
-                _append_stock_counts_preview_to_msg(
-                    msg_lines,
-                    stock_counts_csv=latest_stock_counts,
-                    root_dir=ROOT,
-                    top_n=30,
-                )
-            else:
-                msg_lines.append("pc: stock_counts not found")
+            # latest_stock_counts = _find_latest_stock_counts_csv(pc_csv_dir)
+            # if latest_stock_counts:
+            #     _append_stock_counts_preview_to_msg(
+            #         msg_lines,
+            #         stock_counts_csv=latest_stock_counts,
+            #         root_dir=ROOT,
+            #         top_n=30,
+            #     )
+            # else:
+            #     msg_lines.append("pc: stock_counts not found")
 
             latest_pc_csv = _find_latest_csv_under(pc_csv_dir)
             if latest_pc_csv:

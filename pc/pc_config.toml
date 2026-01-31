@@ -5,8 +5,8 @@
 # 交易日：
 # - "YYYY-MM-DD"：指定日期
 # - 留空：使用当天
-# - "yesterday"（或 "prev" / "-1"）：使用当天的前一天
-trade_date = "yesterday"
+# "yesterday"（或 "prev" / "-1"）：使用上一个交易日
+trade_date = ""
 
 # 每个 sort_type 需要最少输出多少条“符合要求”的策略
 min_count = 10000
@@ -26,10 +26,16 @@ keyword = ""
 
 [filters]
 # 胜率阈值：mwr0 >= 该值
-mwr0_min = 0.8
+mwr0_min = 0.6
 
 # 持股周期阈值：mwr1 <= 该值
 mwr1_max = 5.0
+
+# 是否启用胜率阈值过滤 (mwr0 >= mwr0_min)
+enable_mwr0_filter = false
+
+# 是否启用持股周期阈值过滤 (mwr1 <= mwr1_max)
+enable_mwr1_filter = false
 
 # 是否启用列表页 winRate 预过滤（在 fetch_detail 之前过滤）
 enable_list_winrate_prefilter = true

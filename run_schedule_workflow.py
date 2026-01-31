@@ -105,9 +105,9 @@ def main() -> int:
     flow = str(getattr(args, 'flow', 'all') or 'all').strip().lower()
     skip_snapshot = bool(getattr(args, 'skip_snapshot', False))
 
-    # 05:00 pc（在线策略选股）
+    # 20:00 pc（在线策略选股）
     if flow in ("pc", "all"):
-        schedule.every().day.at("05:00").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
+        schedule.every().day.at("20:00").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
 
     # 14:50 stoploss
     if flow in ("stoploss", "all"):

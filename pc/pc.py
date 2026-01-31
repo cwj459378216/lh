@@ -1,6 +1,7 @@
 import json
 import random
 import time
+import datetime
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -416,7 +417,10 @@ def _replay_from_scanned_records(
         old_prefilter_pass = r.get("prefilter_pass")
 
         list_wr_num = _parse_win_rate_ratio(list_wr)
-        new_prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
+        if mwr0_min < 0:
+            new_prefilter_pass = True
+        else:
+            new_prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
 
         # scan 模式才有 list_winRate；manual 模式记录里为空，此时不做预过滤
         if enable_list_winrate_prefilter and list_wr is not None and not new_prefilter_pass:
@@ -446,7 +450,7 @@ def _replay_from_scanned_records(
         max_win_rate = _get_max_win_rate(backtestresult)
 
         mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
-        if mwr0_num is None or mwr0_num < mwr0_min:
+        if (mwr0_num is None and mwr0_min > 0) or (mwr0_num is not None and mwr0_num < mwr0_min):
             compare_rows.append(
                 {
                     "strategy_id": sid,
@@ -468,7 +472,7 @@ def _replay_from_scanned_records(
             )
             continue
 
-        if mwr1_num is None or mwr1_num > mwr1_max:
+        if (mwr1_num is None and mwr1_max < 9000) or (mwr1_num is not None and mwr1_num > mwr1_max):
             compare_rows.append(
                 {
                     "strategy_id": sid,
@@ -528,6 +532,28 @@ def _replay_from_scanned_records(
             stocks = _get_historypick_stocks(historypick, context="replay", sid=sid, non_dict_verb="提示")
             if stocks:
                 stock_map = _extract_mainboard_stock_map(stocks)
+            
+            if not stock_map:
+                compare_rows.append(
+                    {
+                        "strategy_id": sid,
+                        "sort_type": sort_type,
+                        "page": page,
+                        "list_winRate": list_wr,
+                        "old_prefilter_pass": old_prefilter_pass,
+                        "new_prefilter_pass": new_prefilter_pass,
+                        "replay_mwr0": mwr0,
+                        "replay_mwr0_num": mwr0_num,
+                        "replay_mwr1": mwr1,
+                        "replay_mwr1_num": mwr1_num,
+                        "replay_pass": False,
+                        "replay_reason": "empty_stocks",
+                        "replay_query": query,
+                        "query_sim_best_ratio": None,
+                        "query_sim_pass": None,
+                    }
+                )
+                continue
 
         max_annual_yield = _get_max_annual_yield(backtestresult)
 
@@ -585,6 +611,7 @@ def _collect_rows_for_strategy_ids(
     seen_queries_norm: list[str] | None = None,
     skip_seen_strategy_ids: bool = True,
     query_similarity_threshold: float | None = None,
+    manual_extra_info: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     final_rows: list[dict[str, Any]] = []
 
@@ -643,17 +670,21 @@ def _collect_rows_for_strategy_ids(
             stocks = _get_historypick_stocks(historypick, context="manual", sid=sid, non_dict_verb="提示")
             if stocks:
                 stock_map = _extract_mainboard_stock_map(stocks)
+            
+            if not stock_map:
+                print(f"跳过[manual]：入选股票为空或非主板 sid={sid_int}")
+                continue
 
         backtestresult = fetch_backtestresult(session, sid_int)
         max_annual_yield = _get_max_annual_yield(backtestresult)
         max_win_rate = _get_max_win_rate(backtestresult)
 
         mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
-        if mwr0_num is None or mwr0_num < mwr0_min:
+        if (mwr0_num is None and mwr0_min > 0) or (mwr0_num is not None and mwr0_num < mwr0_min):
             print(f"跳过[manual]：胜率不达标 sid={sid_int} mwr0={mwr0} min={mwr0_min:g}")
             continue
 
-        if mwr1_num is None or mwr1_num > mwr1_max:
+        if (mwr1_num is None and mwr1_max < 9000) or (mwr1_num is not None and mwr1_num > mwr1_max):
             print(f"跳过[manual]：持股周期超限 sid={sid_int} mwr1={mwr1} max={mwr1_max:g}")
             continue
 
@@ -673,6 +704,10 @@ def _collect_rows_for_strategy_ids(
             "maxWinRate": max_win_rate,
             "mainboardStockMap": stock_map,
         }
+
+        if manual_extra_info and sid_int in manual_extra_info:
+            merged.update(manual_extra_info[sid_int])
+
         final_rows.append(merged)
 
     return final_rows
@@ -746,7 +781,11 @@ def _collect_rows_for_sort(
             list_wr = prop.get("winRate")
             list_wr_num = _parse_win_rate_ratio(list_wr)
 
-            prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
+            if mwr0_min < 0:
+                prefilter_pass = True
+            else:
+                prefilter_pass = not (list_wr_num is None or list_wr_num < mwr0_min)
+
             if scanned_strategy_records is not None:
                 scanned_strategy_records.append(
                     {
@@ -808,11 +847,11 @@ def _collect_rows_for_sort(
             max_win_rate = _get_max_win_rate(backtestresult)
 
             mwr0, mwr0_num, mwr1, mwr1_num = _parse_max_win_rate(max_win_rate)
-            if mwr0_num is None or mwr0_num < mwr0_min:
+            if (mwr0_num is None and mwr0_min > 0) or (mwr0_num is not None and mwr0_num < mwr0_min):
                 filtered_out_mwr0 += 1
                 continue
 
-            if mwr1_num is None or mwr1_num > mwr1_max:
+            if (mwr1_num is None and mwr1_max < 9000) or (mwr1_num is not None and mwr1_num > mwr1_max):
                 continue
 
             matched_filters += 1
@@ -860,6 +899,34 @@ def _collect_rows_for_sort(
     return final_rows
 
 
+def _get_prev_trading_date() -> str:
+    """获取上一个交易日（T-1）。
+    策略：
+    1. 尝试 import chinesecalendar 判断中国节假日（不仅周末，含法定节假日）。
+    2. 失败则仅剔除周末。
+    """
+    dt = datetime.date.today() - datetime.timedelta(days=1)
+    
+    # 1. Try chinesecalendar
+    try:
+        import chinesecalendar  # type: ignore
+        while True:
+            # 股市开市条件：非节假日（is_holiday=False）且 非周末
+            # 注：chinesecalendar.is_holiday() 对“调休上班的周末”返回 False。
+            # 但股市在调休上班的周末通常依旧休市。
+            if (not chinesecalendar.is_holiday(dt)) and (dt.weekday() < 5):
+                return dt.strftime("%Y-%m-%d")
+            dt -= datetime.timedelta(days=1)
+    except ImportError:
+        pass
+
+    # 2. Fallback: just skip weekends
+    while dt.weekday() >= 5:  # 0=Mon...5=Sat,6=Sun
+        dt -= datetime.timedelta(days=1)
+    
+    return dt.strftime("%Y-%m-%d")
+
+
 def main(
     *,
     trade_date: str | None = None,
@@ -887,9 +954,8 @@ def main(
         if cfg_trade_date == "":
             cfg_trade_date = None
         elif cfg_trade_date.lower() in ("yesterday", "prev", "-1"):
-            # 交易日（昨天）：按自然日回退一天
-            cfg_trade_date = (time.time() - 86400)
-            cfg_trade_date = time.strftime("%Y-%m-%d", time.localtime(cfg_trade_date))
+            # 交易日（昨天）：使用 T-1 (尝试跳过节假日/周末)
+            cfg_trade_date = _get_prev_trading_date()
     else:
         cfg_trade_date = None
 
@@ -904,6 +970,14 @@ def main(
 
     mwr0_min_cfg = _cfg_get(cfg, ["filters", "mwr0_min"], 0.8)
     mwr1_max_cfg = _cfg_get(cfg, ["filters", "mwr1_max"], 5.0)
+    
+    # 兼容旧配置 enable_mwr_filters，如果存在则优先使用（或作为默认值）
+    _old_enable_all = _cfg_get(cfg, ["filters", "enable_mwr_filters"], None)
+    
+    # 新配置：拆分控制
+    enable_mwr0_filter = bool(_cfg_get(cfg, ["filters", "enable_mwr0_filter"], (_old_enable_all if _old_enable_all is not None else True)))
+    enable_mwr1_filter = bool(_cfg_get(cfg, ["filters", "enable_mwr1_filter"], (_old_enable_all if _old_enable_all is not None else True)))
+
     enable_list_winrate_prefilter = bool(_cfg_get(cfg, ["filters", "enable_list_winrate_prefilter"], True))
     skip_seen_strategy_ids = bool(_cfg_get(cfg, ["filters", "skip_seen_strategy_ids"], True))
 
@@ -927,6 +1001,37 @@ def main(
     if not isinstance(manual_strategy_ids, list):
         manual_strategy_ids = []
 
+    # [Temp Override] 强制加载 csv/1.31.csv 中的策略 ID
+    _csv_target = Path(__file__).parent / "csv" / "1.31_dedup70.csv"
+    manual_extra_info = {}  # newly added to store CSV columns
+
+    if _csv_target.exists():
+        print(f"[Override] 正在从 {_csv_target.name} 加载策略ID...")
+        try:
+            import csv
+            _ids = []
+            with open(_csv_target, "r", encoding="utf-8-sig") as f:
+                _reader = csv.DictReader(f)
+                for _row in _reader:
+                    if _sid := _row.get("strategy_id"):
+                        _ids.append(_sid)
+                        # Capture extra info
+                        try:
+                            _sid_int = int(_sid)
+                            manual_extra_info[_sid_int] = {
+                                "daySaleStrategy": _row.get("daySaleStrategy"),
+                                "winRate": _row.get("winRate"),
+                            }
+                        except:
+                            pass
+
+            if _ids:
+                manual_strategy_ids = _ids
+                use_manual_strategy_ids = True
+                print(f"[Override] 已加载 {len(_ids)} 个ID，自动切换为 Manual 模式。")
+        except Exception as e:
+            print(f"[Override] 读取 CSV 失败: {e}")
+
     # 交易日（None 表示当天）
     if trade_date is None:
         trade_date = time.strftime("%Y-%m-%d")
@@ -935,8 +1040,18 @@ def main(
     MAX_PAGES = int(cfg_max_pages)
     PAGE_NUM = int(cfg_page_num)
 
-    MWR1_MAX = float(mwr1_max_cfg)
-    MWR0_MIN = float(mwr0_min_cfg)
+    if enable_mwr0_filter:
+        MWR0_MIN = float(mwr0_min_cfg)
+    else:
+        MWR0_MIN = -1.0
+        # If mwr0 filter is disabled, list prefilter (which relies on mwr0) should implicitly be disabled
+        # or just be ineffective via -1.0. But to be safe:
+        enable_list_winrate_prefilter = False
+
+    if enable_mwr1_filter:
+        MWR1_MAX = float(mwr1_max_cfg)
+    else:
+        MWR1_MAX = 99999.0
 
     OUTPUT_CSV_FILENAME = time.strftime("%Y%m%d_%H%M%S") + ".csv"
     EXPAND_STOCKS = expand_stocks
@@ -987,7 +1102,15 @@ def main(
                     seen_queries_norm=seen_queries_norm,
                     skip_seen_strategy_ids=skip_seen_strategy_ids,
                     query_similarity_threshold=query_similarity_threshold,
+                    manual_extra_info=manual_extra_info,
                 )
+                # Sort by winRate descending if available (requested by user)
+                def _sort_key_wr(r: dict[str, Any]) -> float:
+                    try:
+                        return float(r.get("winRate", 0))
+                    except Exception:
+                        return -1.0
+                final_rows.sort(key=_sort_key_wr, reverse=True)
             else:
                 effective_sort_types = sort_types_cfg or sort_types or ["winRate","gain", "profit", "hot"]
                 for st in effective_sort_types:
@@ -1035,6 +1158,9 @@ def main(
 
             may0, may1 = _split_first_two(may)
             mwr0, _, mwr1, _ = _parse_max_win_rate(mwr)
+            
+            winRate = r.get("winRate", "")
+            daySaleStrategy = r.get("daySaleStrategy", "")
 
             # 控制台输出
             print(f"策略：{q}")
@@ -1047,6 +1173,7 @@ def main(
             print(f"止损: 收益率 ≤ -{lower} %")
             print(f"最大预期: 年化收益率{may0}, 回测持股周期 {may1} 天")
             print(f"最大胜率: 胜率 {mwr0}, 回测持股周期 {mwr1} 天")
+            print(f"最新胜率: 胜率 {winRate}, 最新的回测持股周期 {daySaleStrategy} 天")
             print(f"入选股票：{stock_map}")
             print("-" * 60)
 
@@ -1066,6 +1193,11 @@ def main(
                 "maxWinRate1": mwr1,
                 "raw_maxWinRate": "" if mwr is None else json.dumps(mwr, ensure_ascii=False),
             }
+
+            if "daySaleStrategy" in r:
+                base_row["daySaleStrategy"] = r["daySaleStrategy"]
+            if "winRate" in r:
+                base_row["winRate"] = r["winRate"]
 
             if EXPAND_STOCKS:
                 # 展开股票为多列（stock_1_code, stock_1_name ...）
@@ -1119,7 +1251,7 @@ def main(
             # 统计：每只股票出现次数（按 sort_type 去重：同一 sort_type 内只算一次）
             from collections import defaultdict
 
-            stock_to_sort_types: dict[tuple[str, str], set[str]] = defaultdict(set)
+            stock_occurrences: dict[tuple[str, str], list[str]] = defaultdict(list)
             for row in csv_rows:
                 st = str(row.get("sort_type") or "")
                 stocks_json = row.get("stocks")
@@ -1132,7 +1264,7 @@ def main(
                         for code, name in sm.items():
                             if not code:
                                 continue
-                            stock_to_sort_types[(str(code), str(name))].add(st)
+                            stock_occurrences[(str(code), str(name))].append(st)
                     continue
 
                 # 兼容 EXPAND_STOCKS=True 的情况
@@ -1143,17 +1275,17 @@ def main(
                     if not code:
                         continue
                     name = str(row.get(k.replace("_code", "_name")) or "")
-                    stock_to_sort_types[(code, name)].add(st)
+                    stock_occurrences[(code, name)].append(st)
 
             stock_count_rows: list[dict[str, Any]] = []
-            for (code, name), sts in stock_to_sort_types.items():
-                sts_sorted = sorted(s for s in sts if s)
+            for (code, name), sts_list in stock_occurrences.items():
+                sts_unique = sorted(list(set(s for s in sts_list if s)))
                 stock_count_rows.append(
                     {
                         "stock_code": code,
                         "stock_name": name,
-                        "count": len(sts_sorted),
-                        "sort_types": ",".join(sts_sorted),
+                        "count": len(sts_list),
+                        "sort_types": ",".join(sts_unique),
                     }
                 )
 
