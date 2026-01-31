@@ -713,6 +713,7 @@ def _collect_rows_for_sort(
     qsim_th = query_similarity_threshold
 
     page = 1
+    stop_winrate_loop_due_to_threshold = False
     while page <= max_pages and len(final_rows) < min_output_count:
         lst = fetch_list(session, page=page, page_num=page_num, sort_type=sort_type, keyword=keyword)
         items = lst.get("result", {}).get("list", []) if isinstance(lst, dict) else []
@@ -761,6 +762,10 @@ def _collect_rows_for_sort(
             if enable_list_winrate_prefilter:
                 if not prefilter_pass:
                     filtered_out_list_winrate += 1
+                    # winRate 排序是按胜率从高到低；一旦低于阈值，后续只会更低，直接停止该循环
+                    if sort_type == "winRate" and list_wr_num is not None and list_wr_num < mwr0_min:
+                        stop_winrate_loop_due_to_threshold = True
+                        break
                     continue
 
             if scanned_strategies % 5 == 0:
@@ -829,6 +834,10 @@ def _collect_rows_for_sort(
             merged["mainboardStockMap"] = stock_map
 
             final_rows.append(merged)
+
+        if stop_winrate_loop_due_to_threshold:
+            print(f"提示[{sort_type}]: 列表胜率已低于阈值 {mwr0_min:g}，停止继续扫描后续页")
+            break
 
         print(
             f"进度[{sort_type}]: page={page}/{max_pages} 完成, 本页策略={len(items)}, 已扫描策略={scanned_strategies}, "
@@ -1055,6 +1064,7 @@ def main(
                 "maxAnnualYield1": may1,
                 "maxWinRate0": mwr0,
                 "maxWinRate1": mwr1,
+                "raw_maxWinRate": "" if mwr is None else json.dumps(mwr, ensure_ascii=False),
             }
 
             if EXPAND_STOCKS:

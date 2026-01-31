@@ -6,3 +6,4 @@ akshare>=1.14.99
 pytdx>=1.72
 schedule>=1.2.2
 chinese_calendar>=1.10.0
+playwright>=1.48.0

@@ -11,3 +11,13 @@
 !autoTest/*
 !pc/
 !pc/*
+!pc/csv/
+!pc/csv/*
+
+# 本地敏感信息（不要提交）
+pc/ths_secrets.toml
+pc/ths_secrets.json
+
+# Playwright 浏览器持久化 profile（含登录态/缓存，不要提交）
+pc/.pw-profile/
+pc/.pw-profile/**
