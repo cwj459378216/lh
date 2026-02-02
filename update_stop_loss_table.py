@@ -240,7 +240,9 @@ def _update_buy_detail_row(
 
     for d in df2['trade_date'].sort_values().tolist():
         d = pd.to_datetime(d)
-        should_exit, rs = evaluate_exit_signal(sl_cfg, df2, pos, d)
+        # 注意：止损规则里“跌破信号日开盘价止损”需要读取 signal_date 当天 open。
+        # signal_date 往往早于 buy_date（信号日->次日开盘买入），若用 df2(从 buy_date 截断)会取不到。
+        should_exit, rs = evaluate_exit_signal(sl_cfg, df, pos, d)
         if should_exit:
             # 至少持有 1 天：避免买卖同日
             if _same_day(d, buy_date):
@@ -386,7 +388,9 @@ def _update_selection_maintain_form_row(
 
     for d in df2['trade_date'].sort_values().tolist():
         d = pd.to_datetime(d)
-        should_exit, rs = evaluate_exit_signal(sl_cfg, df2, pos, d)
+        # 注意：止损规则里“跌破信号日开盘价止损”需要读取 signal_date 当天 open。
+        # signal_date 往往早于 buy_date（信号日->次日开盘买入），若用 df2(从 buy_date 截断)会取不到。
+        should_exit, rs = evaluate_exit_signal(sl_cfg, df, pos, d)
         if should_exit:
             # 至少持有 1 天：避免同一天买卖
             if _same_day(d, buy_date):
