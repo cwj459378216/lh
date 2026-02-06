@@ -121,6 +121,9 @@ def main() -> int:
     if flow in ("pc", "all"):
         schedule.every().day.at("09:45").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
 
+    if flow in ("pc", "all"):
+        schedule.every().day.at("11:45").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
+
     # 14:50 stoploss
     if flow in ("stoploss", "all"):
         schedule.every().day.at("14:50").do(_run_flow, flow="stoploss", skip_snapshot=skip_snapshot)

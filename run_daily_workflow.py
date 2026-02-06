@@ -71,11 +71,24 @@ def _run(cmd: list[str], cwd: str | None = None) -> None:
 def _run_capture(cmd: list[str], cwd: str | None = None) -> tuple[int, str]:
     """运行命令并捕获输出（用于做兼容性回退判断）。"""
     print("\n$ " + " ".join(cmd), flush=True)
-    p = subprocess.run(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    out = p.stdout or ""
-    # 让用户仍然看到原始输出
-    if out:
-        print(out, end="" if out.endswith("\n") else "\n")
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    p = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        bufsize=1,
+    )
+    out_lines: list[str] = []
+    assert p.stdout is not None
+    for line in p.stdout:
+        out_lines.append(line)
+        print(line, end="")
+    p.wait()
+    out = "".join(out_lines)
     return int(p.returncode), out
 
 
@@ -129,7 +142,7 @@ def _extract_snapshot_summary(output: str) -> str:
 
 
 def _parse_and_send_individual_strategies(output: str, webhook: str) -> tuple[int, Counter]:
-    """解析 pc.py 输出，提取策略块。若最新胜率 > 60，则单独发送一条通知。
+    """解析 pc.py 输出，提取策略块。若最新胜率 > 70，则单独发送一条通知。
     返回 (发送条数, 股票统计Counter)。
     """
     stats = Counter()
@@ -180,7 +193,7 @@ def _parse_and_send_individual_strategies(output: str, webhook: str) -> tuple[in
         if match:
             try:
                 val = float(match.group(1))
-                if val > 60.0:
+                if val > 70.0:
                     # 解析股票并统计
                     if stock_map_str:
                         try:
@@ -553,7 +566,7 @@ def main() -> int:
                         for (code, name), count in stock_stats.most_common():
                             msg_lines.append(f"{code} {name} x{count}")
                 else:
-                    msg_lines.append("pc: no strategies met condition (>60%)")
+                    msg_lines.append("pc: no strategies met condition (>70%)")
 
             # 尝试找到最新输出的 CSV（pc/csv 下）
             pc_csv_dir = os.path.join(pc_dir, "csv")

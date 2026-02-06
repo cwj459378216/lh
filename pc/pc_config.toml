@@ -9,10 +9,10 @@
 trade_date = "yesterday"
 
 # 每个 sort_type 需要最少输出多少条“符合要求”的策略
-min_count = 10000
+min_count = 10
 
 # 最大翻页数
-max_pages = 10000
+max_pages = 10
 
 # 每页数量
 page_num = 10

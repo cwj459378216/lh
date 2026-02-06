@@ -1038,6 +1038,14 @@ def main(
     if not override_csv_path:
         override_csv_path = str(Path(__file__).parent / "csv" / "1.31_dedup70.csv")
     _csv_target = Path(override_csv_path)
+    if not _csv_target.is_absolute():
+        _pc_dir = Path(__file__).parent
+        _csv_target = (_pc_dir / _csv_target).resolve()
+        if not _csv_target.exists():
+            _repo_root = _pc_dir.parent
+            _alt_target = (_repo_root / override_csv_path).resolve()
+            if _alt_target.exists():
+                _csv_target = _alt_target
 
     if override_enabled and _csv_target.exists():
         print(f"[Override] 正在从 {_csv_target.name} 加载策略ID...")
