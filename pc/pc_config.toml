@@ -6,7 +6,7 @@
 # - "YYYY-MM-DD"：指定日期
 # - 留空：使用当天
 # "yesterday"（或 "prev" / "-1"）：使用上一个交易日
-trade_date = ""
+trade_date = "yesterday"
 
 # 每个 sort_type 需要最少输出多少条“符合要求”的策略
 min_count = 10000
@@ -59,7 +59,10 @@ output_replay_compare_csv = false
 [manual]
 # 手动模式：跳过翻页扫描，直接用 strategy_ids
 use_manual_strategy_ids = false
-strategy_ids = [295747]
+strategy_ids = [440616]
+
+use_override_csv = true
+override_csv_path = "pc/csv/1.31_dedup70.csv"
 
 [replay]
 # 回放模式：读取已导出的 *_scanned_strategy_ids.csv，再重新筛选一遍（用于对比）

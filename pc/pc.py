@@ -2,6 +2,7 @@ import json
 import random
 import time
 import datetime
+import os
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -257,14 +258,27 @@ def fetch_backtestresult(session: requests.Session, strategy_id: int) -> Any:
     return fetch_json(session, url)
 
 
+def _as_dict_json(obj: Any) -> Dict[str, Any]:
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, str):
+        s = obj.strip()
+        if not s:
+            return {}
+        try:
+            v = json.loads(s)
+        except Exception:
+            return {}
+        return v if isinstance(v, dict) else {}
+    return {}
+
+
 def _get_report_data(backtestresult: Any) -> Dict[str, Any]:
-    if not isinstance(backtestresult, dict):
-        return {}
-    return (
-        backtestresult.get("result", {})
-        .get("statistics", {})
-        .get("reportData", {})
-    )
+    bt = _as_dict_json(backtestresult)
+    result = _as_dict_json(bt.get("result", {}))
+    statistics = _as_dict_json(result.get("statistics", {}))
+    report_data = _as_dict_json(statistics.get("reportData", {}))
+    return report_data
 
 
 def _get_max_annual_yield(backtestresult: Any) -> Any:
@@ -648,9 +662,9 @@ def _collect_rows_for_strategy_ids(
                 }
             )
 
-        detail = fetch_detail(session, sid_int)
-        result = detail.get("result", {}) if isinstance(detail, dict) else {}
-        qs = result.get("queryString", {}) if isinstance(result, dict) else {}
+        detail = _as_dict_json(fetch_detail(session, sid_int))
+        result = _as_dict_json(detail.get("result", {}))
+        qs = _as_dict_json(result.get("queryString", {}))
 
         query = qs.get("query")
         day_buy_stock_num = qs.get("dayBuyStockNum")
@@ -943,12 +957,15 @@ def main(
     # 配置优先：读取 pc_config.toml（同目录）
     # =============================
     cfg = _load_config()
+    env_trade_date = os.environ.get("PC_TRADE_DATE")
 
     # trade_date 支持：
     # - 留空/None：使用当天
     # - "YYYY-MM-DD"：指定交易日
     # - "yesterday" / "prev" / "-1"：使用当天的前一天
     cfg_trade_date = _cfg_get(cfg, ["run", "trade_date"], trade_date)
+    if env_trade_date:
+        cfg_trade_date = env_trade_date
     if cfg_trade_date is not None:
         cfg_trade_date = str(cfg_trade_date).strip()
         if cfg_trade_date == "":
@@ -1001,11 +1018,28 @@ def main(
     if not isinstance(manual_strategy_ids, list):
         manual_strategy_ids = []
 
-    # [Temp Override] 强制加载 csv/1.31.csv 中的策略 ID
-    _csv_target = Path(__file__).parent / "csv" / "1.31_dedup70.csv"
+    # [Override] 可选：从 CSV 强制加载策略 ID
     manual_extra_info = {}  # newly added to store CSV columns
+    override_enabled = bool(
+        _cfg_get(
+            cfg,
+            ["manual", "use_override_csv"],
+            _cfg_get(cfg, ["manual", "manual", "use_override_csv"], True),
+        )
+    )
+    override_csv_path = str(
+        _cfg_get(
+            cfg,
+            ["manual", "override_csv_path"],
+            _cfg_get(cfg, ["manual", "manual", "override_csv_path"], ""),
+        )
+        or ""
+    ).strip()
+    if not override_csv_path:
+        override_csv_path = str(Path(__file__).parent / "csv" / "1.31_dedup70.csv")
+    _csv_target = Path(override_csv_path)
 
-    if _csv_target.exists():
+    if override_enabled and _csv_target.exists():
         print(f"[Override] 正在从 {_csv_target.name} 加载策略ID...")
         try:
             import csv
@@ -1022,7 +1056,7 @@ def main(
                                 "daySaleStrategy": _row.get("daySaleStrategy"),
                                 "winRate": _row.get("winRate"),
                             }
-                        except:
+                        except Exception:
                             pass
 
             if _ids:
@@ -1053,7 +1087,13 @@ def main(
     else:
         MWR1_MAX = 99999.0
 
-    OUTPUT_CSV_FILENAME = time.strftime("%Y%m%d_%H%M%S") + ".csv"
+    _output_filename_env = os.environ.get("PC_OUTPUT_FILENAME")
+    if _output_filename_env:
+        OUTPUT_CSV_FILENAME = _output_filename_env
+        if not OUTPUT_CSV_FILENAME.lower().endswith(".csv"):
+            OUTPUT_CSV_FILENAME += ".csv"
+    else:
+        OUTPUT_CSV_FILENAME = time.strftime("%Y%m%d_%H%M%S") + ".csv"
     EXPAND_STOCKS = expand_stocks
     OUTPUT_SCANNED_STRATEGY_IDS_CSV = output_scanned_strategy_ids_csv
     REPLAY_FROM_SCANNED_CSV_PATH = replay_from_scanned_csv_path
@@ -1136,7 +1176,6 @@ def main(
         # =============================
         # 输出：控制台 + CSV
         # =============================
-        import os
 
         # 整理为可写入 CSV 的结构（final_rows 已是最终口径）
         csv_rows: list[dict[str, Any]] = []
