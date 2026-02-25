@@ -233,7 +233,7 @@ def main():
         today = args.date
         today_dt = dt.datetime.strptime(today, "%Y-%m-%d").date()
 
-        if not _is_cn_trading_day(today_dt):
+        if not is_cn_trading_day(today_dt):
             print(f"非交易日，跳过更新: {today}")
             return
 
