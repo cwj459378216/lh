@@ -16,6 +16,8 @@ import csv
 import datetime as dt
 from typing import Dict, Any
 
+from utils.trading_calendar import is_cn_trading_day
+
 
 STANDARD_HEADERS = ["trade_date", "open", "high", "low", "close", "volume", "amount"]
 
@@ -225,6 +227,11 @@ def main():
     try:
         data_dir = os.path.abspath(args.data_dir)
         today = args.date
+        today_dt = dt.datetime.strptime(today, "%Y-%m-%d").date()
+
+        if not _is_cn_trading_day(today_dt):
+            print(f"非交易日，跳过更新: {today}")
+            return
 
         if not os.path.isdir(data_dir):
             raise RuntimeError(f"目录不存在: {data_dir}")

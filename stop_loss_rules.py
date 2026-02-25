@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import pandas as pd
 
+from utils.trading_calendar import is_cn_trading_day
+
 
 @dataclass
 class StopLossConfig:
@@ -82,6 +84,7 @@ def is_last_n_days_all_down(symbol_df: pd.DataFrame, date: pd.Timestamp, n: int 
     if symbol_df is None or symbol_df.empty:
         return False
     df = symbol_df[symbol_df['trade_date'] <= date].sort_values('trade_date')
+    df = df[df['trade_date'].map(_is_cn_trading_day)]
     if len(df) < n:
         return False
     tail = df.tail(n)
@@ -100,7 +103,11 @@ def _count_trading_days_inclusive(symbol_df: pd.DataFrame, start: pd.Timestamp, 
     df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
     df = df.dropna().sort_values('trade_date')
     m = (df['trade_date'] >= pd.to_datetime(start)) & (df['trade_date'] <= pd.to_datetime(end))
-    return int(m.sum())
+    df = df.loc[m]
+    if df.empty:
+        return 0
+    df = df[df['trade_date'].map(_is_cn_trading_day)]
+    return int(len(df))
 
 
 def _count_red_days_inclusive(symbol_df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> int:
@@ -114,6 +121,9 @@ def _count_red_days_inclusive(symbol_df: pd.DataFrame, start: pd.Timestamp, end:
     sub = df.loc[m]
     if sub.empty:
         return 0
+    sub = sub[sub['trade_date'].map(_is_cn_trading_day)]
+    if sub.empty:
+        return 0
     red = (pd.to_numeric(sub['close'], errors='coerce') > pd.to_numeric(sub['open'], errors='coerce'))
     return int(red.fillna(False).sum())
 
@@ -125,10 +135,19 @@ def _get_nth_trading_day(symbol_df: pd.DataFrame, start: pd.Timestamp, n: int) -
     df = symbol_df[['trade_date']].dropna().copy()
     df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
     df = df.dropna().sort_values('trade_date')
-    sub = df[df['trade_date'] >= pd.to_datetime(start)]['trade_date'].reset_index(drop=True)
+    sub = df[df['trade_date'] >= pd.to_datetime(start)]['trade_date']
+    sub = sub[sub.map(_is_cn_trading_day)].reset_index(drop=True)
     if n <= 0 or len(sub) < n:
         return None
     return pd.to_datetime(sub.iloc[n - 1])
+
+
+def _is_cn_trading_day(d: pd.Timestamp) -> bool:
+    """兼容 pandas.Timestamp 的交易日判断。"""
+    try:
+        return is_cn_trading_day(d.date())
+    except Exception:
+        return False
 
 
 def _dynamic_drawdown_threshold(cfg: StopLossConfig, entry_price: float, peak_close: float) -> float:

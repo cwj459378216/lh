@@ -10,6 +10,8 @@ from pathlib import Path
 
 import requests
 
+from utils.trading_calendar import get_prev_trading_date_str
+
 
 # =============================
 # Query similarity de-dup (>= threshold)
@@ -919,26 +921,7 @@ def _get_prev_trading_date() -> str:
     1. 尝试 import chinesecalendar 判断中国节假日（不仅周末，含法定节假日）。
     2. 失败则仅剔除周末。
     """
-    dt = datetime.date.today() - datetime.timedelta(days=1)
-    
-    # 1. Try chinesecalendar
-    try:
-        import chinesecalendar  # type: ignore
-        while True:
-            # 股市开市条件：非节假日（is_holiday=False）且 非周末
-            # 注：chinesecalendar.is_holiday() 对“调休上班的周末”返回 False。
-            # 但股市在调休上班的周末通常依旧休市。
-            if (not chinesecalendar.is_holiday(dt)) and (dt.weekday() < 5):
-                return dt.strftime("%Y-%m-%d")
-            dt -= datetime.timedelta(days=1)
-    except ImportError:
-        pass
-
-    # 2. Fallback: just skip weekends
-    while dt.weekday() >= 5:  # 0=Mon...5=Sat,6=Sun
-        dt -= datetime.timedelta(days=1)
-    
-    return dt.strftime("%Y-%m-%d")
+    return get_prev_trading_date_str()
 
 
 def main(

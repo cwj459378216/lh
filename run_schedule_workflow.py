@@ -39,10 +39,7 @@ from datetime import date as dt_date
 
 import schedule
 
-try:
-    from chinese_calendar import is_workday  # type: ignore
-except Exception:  # pragma: no cover
-    is_workday = None
+from utils.trading_calendar import is_cn_trading_day
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -57,21 +54,10 @@ def _today() -> dt_date:
     return datetime.now().date()
 
 
-def _is_cn_workday(d: dt_date) -> bool:
-    """是否中国法定工作日。
-
-    依赖 chinese_calendar；若不可用则退化为周一~周五。
-    """
-    if is_workday is not None:
-        return bool(is_workday(d))
-    # fallback：周一~周五
-    return d.weekday() < 5
-
-
 def _run_flow(flow: str, skip_snapshot: bool) -> None:
     today = _today()
-    if not _is_cn_workday(today):
-        print(f"\n[{_now()}] SKIP (not CN workday): {today} flow={flow}", flush=True)
+    if not is_cn_trading_day(today):
+        print(f"\n[{_now()}] SKIP (not CN trading day): {today} flow={flow}", flush=True)
         return
 
     cmd = [PY, os.path.join(ROOT, "run_daily_workflow.py"), "--flow", flow]
