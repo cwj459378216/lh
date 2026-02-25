@@ -16,7 +16,11 @@ import csv
 import datetime as dt
 from typing import Dict, Any
 
-from utils.trading_calendar import is_cn_trading_day
+try:
+    from utils.trading_calendar import is_cn_trading_day
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.trading_calendar import is_cn_trading_day
 
 
 STANDARD_HEADERS = ["trade_date", "open", "high", "low", "close", "volume", "amount"]

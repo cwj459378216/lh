@@ -3,6 +3,7 @@ import random
 import time
 import datetime
 import os
+import sys
 from typing import Any, Dict
 from urllib.parse import quote
 
@@ -10,7 +11,13 @@ from pathlib import Path
 
 import requests
 
-from utils.trading_calendar import get_prev_trading_date_str
+try:
+    from utils.trading_calendar import get_prev_trading_date_str
+except ModuleNotFoundError:
+    _ROOT = Path(__file__).resolve().parent.parent
+    if str(_ROOT) not in sys.path:
+        sys.path.append(str(_ROOT))
+    from utils.trading_calendar import get_prev_trading_date_str
 
 
 # =============================

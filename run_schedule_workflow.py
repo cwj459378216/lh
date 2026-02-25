@@ -39,7 +39,11 @@ from datetime import date as dt_date
 
 import schedule
 
-from utils.trading_calendar import is_cn_trading_day
+try:
+    from utils.trading_calendar import is_cn_trading_day
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.trading_calendar import is_cn_trading_day
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))

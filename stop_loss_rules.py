@@ -18,9 +18,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import sys
 import pandas as pd
 
-from utils.trading_calendar import is_cn_trading_day
+try:
+    from utils.trading_calendar import is_cn_trading_day
+except ModuleNotFoundError:
+    sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+    from utils.trading_calendar import is_cn_trading_day
 
 
 @dataclass
