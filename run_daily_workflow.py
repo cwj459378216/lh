@@ -52,7 +52,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # 持仓上限（可配置）
-MAX_HOLDINGS = 4
+MAX_HOLDINGS = 3
 
 # 企业微信机器人 webhook（写死默认值；如需变更，直接改这里即可）
 DEFAULT_WECOM_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=de57fc57-503b-4b2d-b62f-f5a0cb92bd59"
