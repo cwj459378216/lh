@@ -3,7 +3,7 @@
 流程化控制脚本：
 1) 运行 update_realtime_snapshot.py 更新当日实时数据，并打印更新统计
 2) 运行 select_stocks_local.py 筛选当日符合条件的股票，并打印选股结果（前 N 行）
-3) 运行 update_stop_loss_table.py 更新 output/选股维护表单.csv 的平仓信息，并打印“当日平仓”明细
+3) 运行 update_stop_loss_table.py 更新 output/选股维护表单.csv 的平仓信息，并打印“截至 end-date 已平仓”明细
 
 用法示例：
   # 不传 --signal-date/--end-date 时，默认使用“当天”日期
@@ -25,7 +25,7 @@
 
 说明：
 - 本脚本通过子进程调用现有脚本，尽量不侵入原逻辑。
-- “当日平仓”定义：在选股维护表单中，平仓日期 == end-date 且 是否平仓 == 是。
+- “当日平仓”定义：在选股维护表单中，平仓日期 <= end-date 且 是否平仓 == 是。
 
 新增：支持拆分为两个“定时子流程”
 - flow=stoploss: update_realtime_snapshot(仅未平仓股票) -> update_stop_loss_table
@@ -52,7 +52,7 @@ import urllib.request
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # 持仓上限（可配置）
-MAX_HOLDINGS = 3
+MAX_HOLDINGS = 4
 
 # 企业微信机器人 webhook（写死默认值；如需变更，直接改这里即可）
 DEFAULT_WECOM_WEBHOOK = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=de57fc57-503b-4b2d-b62f-f5a0cb92bd59"
@@ -157,10 +157,56 @@ def _load_selected_for_signal_date(selection_form: str, signal_date: str) -> pd.
     df2 = df2[df2['信号日'] == str(signal_date).strip()]
 
     # 只保留关键信息列（存在就留）
-    keep = [c for c in ['信号日', '股票代码', '原始评分'] if c in df2.columns]
+    keep = [c for c in ['信号日', '股票代码', '股票名', '原始评分'] if c in df2.columns]
     if keep:
         df2 = df2[keep]
     return df2.reset_index(drop=True)
+
+
+def _load_code_name_map() -> dict[str, str]:
+    """从 csv/stock_code_mapping.csv 读取 symbol->name 映射。"""
+    map_path = os.path.join(ROOT, "csv", "stock_code_mapping.csv")
+    if not os.path.exists(map_path):
+        return {}
+    try:
+        df_map = pd.read_csv(map_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    except Exception:
+        return {}
+    if df_map is None or df_map.empty:
+        return {}
+    if "symbol" not in df_map.columns or "name" not in df_map.columns:
+        return {}
+    out: dict[str, str] = {}
+    for _, r in df_map.iterrows():
+        sym = str(r.get("symbol", "") or "").strip().upper()
+        name = str(r.get("name", "") or "").strip()
+        if sym and name and sym not in out:
+            out[sym] = name
+    return out
+
+
+def _attach_stock_name(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    if "股票代码" not in df.columns:
+        return df
+    name_map = _load_code_name_map()
+    if not name_map:
+        return df
+    df2 = df.copy()
+    if "股票名" not in df2.columns:
+        df2["股票名"] = ""
+    name_series = df2["股票名"].astype(str).fillna("")
+    fill_mask = name_series.str.strip() == ""
+    if fill_mask.any():
+        df2.loc[fill_mask, "股票名"] = df2.loc[fill_mask, "股票代码"].map(
+            lambda x: name_map.get(_normalize_code(x), "")
+        )
+    return df2
+
+
+def _row_key(code: str, signal_date: str) -> str:
+    return f"{_normalize_code(code)}|{str(signal_date or '').strip().replace('-', '')}"
 
 
 def _normalize_code(val: str) -> str:
@@ -250,12 +296,26 @@ def _cap_holdings_in_form(selection_form: str, signal_date: str, max_holdings: i
     return len(keep_unsold_idx)
 
 
-def _send_wecom_text(webhook_url: str, content: str, timeout: int = 10) -> tuple[int | None, str]:
-    """发送企业微信机器人文本消息。返回 (errcode, errmsg)。"""
-    payload = {
-        "msgtype": "text",
-        "text": {"content": content},
-    }
+def _send_wecom_text(
+    webhook_url: str,
+    content: str,
+    timeout: int = 10,
+    msgtype: str = "text",
+) -> tuple[int | None, str]:
+    """发送企业微信机器人消息（默认 text）。返回 (errcode, errmsg)。"""
+    msgtype = str(msgtype or "text").strip().lower()
+    if msgtype != "markdown":
+        msgtype = "text"
+    if msgtype == "markdown":
+        payload = {
+            "msgtype": "markdown",
+            "markdown": {"content": content},
+        }
+    else:
+        payload = {
+            "msgtype": "text",
+            "text": {"content": content},
+        }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         webhook_url,
@@ -329,7 +389,7 @@ def main() -> int:
         # 1) 更新实时快照（可按需跳过）
         if skip_snapshot:
             print("1. 跳过 update_realtime_snapshot（--skip-snapshot）")
-            msg_lines.append("1. skip update_realtime_snapshot (--skip-snapshot)")
+            msg_lines.append("数据更新成功(跳过)")
         else:
             snap_cmd = [sys.executable, os.path.join(ROOT, "update_realtime_snapshot.py")]
             if flow == "stoploss":
@@ -337,16 +397,20 @@ def main() -> int:
 
             rc1, out1 = _run_capture(snap_cmd, cwd=ROOT)
             if rc1 != 0:
+                msg_lines.append("数据更新失败")
                 raise subprocess.CalledProcessError(rc1, snap_cmd)
 
             snap_summary = _extract_snapshot_summary(out1)
             if snap_summary:
-                line1 = "1. " + snap_summary
+                line1 = "数据更新成功"
                 print(line1)
                 msg_lines.append(line1)
 
         # 2) 选股（flow=select/full）
         if flow in ("select", "full"):
+            holdings_before = _load_unsold_holdings(selection_form)
+            holdings_before_count = len(holdings_before)
+
             select_cmd = [
                 sys.executable,
                 os.path.join(ROOT, "select_stocks_local.py"),
@@ -378,53 +442,55 @@ def main() -> int:
             else:
                 df_selected = _load_selected_for_signal_date(selection_form, signal_date)
 
+            df_selected = _attach_stock_name(df_selected)
+
             holdings = _load_unsold_holdings(selection_form)
             holdings_count = len(holdings)
 
-            if flow == "select" and holdings_count > MAX_HOLDINGS:
-                suppress_notify = True
-                print(f"2.=== 持仓数={holdings_count}，超过 3，跳过通知")
+            if flow == "select" and holdings_before_count > MAX_HOLDINGS:
+                print(f"2.=== 持仓数={holdings_before_count}，超过 {MAX_HOLDINGS}")
+                msg_lines.append(f"持仓数={holdings_before_count}，超过上限={MAX_HOLDINGS}")
             else:
                 print("2.=== 选中股票")
-                msg_lines.append(
-                    f"2.=== 选中股票(rows={0 if df_selected is None else len(df_selected)}, holdings={holdings_count})"
-                )
 
-                if df_selected is not None and (not df_selected.empty):
-                    df_send_base = df_selected.copy()
-                    if "股票代码" in df_send_base.columns:
-                        df_send_base["__code"] = df_send_base["股票代码"].apply(_normalize_code)
-                        if holdings:
-                            df_send_base = df_send_base[~df_send_base["__code"].isin(holdings)]
-                        df_send_base = df_send_base.drop(columns=["__code"], errors="ignore")
+                df_send_base = df_selected.copy() if df_selected is not None else pd.DataFrame()
+                if not df_send_base.empty and "股票代码" in df_send_base.columns:
+                    df_send_base["__code"] = df_send_base["股票代码"].apply(_normalize_code)
+                    if holdings_before:
+                        df_send_base = df_send_base[~df_send_base["__code"].isin(holdings_before)]
+                    df_send_base = df_send_base.drop(columns=["__code"], errors="ignore")
 
-                    capacity = max(0, MAX_HOLDINGS - holdings_count)
-                    if capacity < len(df_send_base):
-                        df_send_base = _pick_top_by_score(df_send_base, capacity)
+                df_send_base = _attach_stock_name(df_send_base)
 
-                    # 企业微信文本限制较紧：只发简表（最多 30 行，且只发关键列）
-                    df_send = df_send_base.copy()
-                    keep_cols = [c for c in ['信号日', '股票代码', '原始评分'] if c in df_send.columns]
-                    if keep_cols:
-                        df_send = df_send[keep_cols]
-                    df_send = df_send.head(30)
+                capacity = max(0, MAX_HOLDINGS - holdings_before_count)
+                if capacity < len(df_send_base):
+                    df_send_base = _pick_top_by_score(df_send_base, capacity)
 
-                    for _, r in df_send.iterrows():
-                        parts = []
-                        if '股票代码' in df_send.columns:
-                            parts.append(str(r.get('股票代码', '')).strip())
-                        if '原始评分' in df_send.columns and str(r.get('原始评分', '')).strip():
-                            parts.append(f"score={str(r.get('原始评分', '')).strip()}")
-                        if '信号日' in df_send.columns and str(r.get('信号日', '')).strip():
-                            parts.append(f"sig={str(r.get('信号日', '')).strip()}")
-                        s = ' '.join([p for p in parts if p])
-                        if s:
-                            msg_lines.append(s)
+                total_selected = int(len(df_selected)) if df_selected is not None else 0
+                picked_count = int(len(df_send_base))
+                msg_lines.append(f"一共选股{total_selected}个，入选{picked_count}个")
+
+                # 企业微信文本限制较紧：只发简表（最多 30 行）
+                df_send = df_send_base.copy().head(30) if df_send_base is not None else pd.DataFrame()
+
+                for _, r in df_send.iterrows():
+                    code = str(r.get('股票代码', '')).strip()
+                    name = str(r.get('股票名', '')).strip() if '股票名' in df_send.columns else ''
+                    if not name:
+                        name = code
+                    if code:
+                        msg_lines.append(f"🔴{name}：{code}")
 
                 _print_df(df_selected, "选中股票", max_rows=int(args.print_selected))
 
         # 3) 更新平仓信息（flow=stoploss/full）
         if flow in ("stoploss", "full"):
+            df_form_before = None
+            if os.path.exists(selection_form):
+                try:
+                    df_form_before = _read_csv_smart(selection_form)
+                except Exception:
+                    df_form_before = None
             stop_loss_cmd = [
                 sys.executable,
                 os.path.join(ROOT, "update_stop_loss_table.py"),
@@ -440,6 +506,33 @@ def main() -> int:
             else:
                 df_form = _read_csv_smart(selection_form)
 
+                # 仅保留“是否平仓”从否/空到是的行
+                newly_closed_keys: set[str] = set()
+                if df_form_before is not None and not df_form_before.empty:
+                    try:
+                        before = df_form_before.copy()
+                        after = df_form.copy()
+
+                        if "信号日" in before.columns and "信号日" in after.columns:
+                            before["信号日"] = before["信号日"].astype(str).str.strip().str.replace("-", "", regex=False)
+                            after["信号日"] = after["信号日"].astype(str).str.strip().str.replace("-", "", regex=False)
+
+                        before_map: dict[str, str] = {}
+                        if "股票代码" in before.columns and "信号日" in before.columns and "是否平仓" in before.columns:
+                            for _, r in before.iterrows():
+                                k = _row_key(r.get("股票代码", ""), r.get("信号日", ""))
+                                before_map[k] = str(r.get("是否平仓", "")).strip()
+
+                        if "股票代码" in after.columns and "信号日" in after.columns and "是否平仓" in after.columns:
+                            for _, r in after.iterrows():
+                                k = _row_key(r.get("股票代码", ""), r.get("信号日", ""))
+                                after_flag = str(r.get("是否平仓", "")).strip()
+                                before_flag = str(before_map.get(k, "")).strip()
+                                if after_flag == "是" and before_flag != "是":
+                                    newly_closed_keys.add(k)
+                    except Exception:
+                        newly_closed_keys = set()
+
                 # 规范列名
                 cols = {str(c).strip(): c for c in df_form.columns}
                 must = ["是否平仓", "平仓日期"]
@@ -449,38 +542,45 @@ def main() -> int:
                         _print_df(df_form, f"维护表单: {os.path.relpath(selection_form, ROOT)}", max_rows=50)
                         break
                 else:
-                    # 当日平仓：平仓日期 == end_date 且 是否平仓 == 是
+                    # 当日平仓：平仓日期 <= end_date 且 是否平仓 == 是
                     df_closed = df_form.copy()
                     df_closed["是否平仓"] = df_closed["是否平仓"].astype(str).str.strip()
                     df_closed["平仓日期"] = df_closed["平仓日期"].astype(str).str.strip().str.replace("-", "", regex=False)
 
-                    df_closed = df_closed[(df_closed["是否平仓"] == "是") & (df_closed["平仓日期"] == end_date)].copy()
+                    df_closed = df_closed[
+                        (df_closed["是否平仓"] == "是")
+                        & (df_closed["平仓日期"].astype(str) <= end_date)
+                    ].copy()
+
+                    if newly_closed_keys:
+                        df_closed["__key"] = df_closed.apply(
+                            lambda r: _row_key(r.get("股票代码", ""), r.get("信号日", "")),
+                            axis=1,
+                        )
+                        df_closed = df_closed[df_closed["__key"].isin(newly_closed_keys)].copy()
+                        df_closed = df_closed.drop(columns=["__key"], errors="ignore")
 
                     sort_cols = [c for c in ["平仓日期", "股票代码", "信号日", "平仓原因"] if c in df_closed.columns]
                     if sort_cols:
                         df_closed = df_closed.sort_values(sort_cols)
 
                     print("3. 当日平仓股票")
-                    msg_lines.append(f"3. 当日平仓股票(end-date={end_date}, rows={len(df_closed)})")
 
                     if df_closed is not None and (not df_closed.empty):
-                        df_send2 = df_closed.copy()
-                        keep_cols2 = [c for c in ['股票代码', '平仓日期', '平仓原因', '信号日'] if c in df_send2.columns]
+                        df_send2 = _attach_stock_name(df_closed.copy())
+                        keep_cols2 = [c for c in ['股票代码', '股票名', '平仓原因'] if c in df_send2.columns]
                         if keep_cols2:
                             df_send2 = df_send2[keep_cols2]
                         df_send2 = df_send2.head(50)
 
                         for _, r in df_send2.iterrows():
-                            parts = []
-                            if '股票代码' in df_send2.columns:
-                                parts.append(str(r.get('股票代码', '')).strip())
-                            if '平仓日期' in df_send2.columns and str(r.get('平仓日期', '')).strip():
-                                parts.append(f"close={str(r.get('平仓日期', '')).strip()}")
-                            if '平仓原因' in df_send2.columns and str(r.get('平仓原因', '')).strip():
-                                parts.append(str(r.get('平仓原因', '')).strip())
-                            s = ' '.join([p for p in parts if p])
-                            if s:
-                                msg_lines.append(s)
+                            code = str(r.get('股票代码', '')).strip()
+                            name = str(r.get('股票名', '')).strip() if '股票名' in df_send2.columns else ''
+                            if not name:
+                                name = code
+                            reason = str(r.get('平仓原因', '')).strip() or "SELL"
+                            if name:
+                                msg_lines.append(f"🟢{name}: {reason}")
 
                     _print_df(df_closed, f"当日平仓股票(end-date={end_date})", max_rows=int(args.print_closed))
 
@@ -492,14 +592,25 @@ def main() -> int:
     finally:
         # 发送企业微信（无论成功/失败）
         if wecom_webhook and (not suppress_notify):
-            if flow in ("select", "stoploss"):
+            if status != "OK" and msg_lines == ["数据更新失败"]:
+                content = "数据更新失败"
+            elif flow == "stoploss":
+                clean_lines = [x for x in msg_lines if str(x).strip()]
+                content = "\n".join(clean_lines)
+                if not content:
+                    content = "数据更新成功"
+            elif flow in ("select", "stoploss"):
                 clean_lines = [x for x in msg_lines if str(x).strip()]
                 if flow == "select":
                     content = "\n".join(clean_lines)
                     if not content:
                         content = "当日无选中股票"
                 else:
-                    body_lines = [x for x in clean_lines if not str(x).strip().startswith("3.")]
+                    body_lines = [
+                        x for x in clean_lines
+                        if not str(x).strip().startswith("1.")
+                        and not str(x).strip().startswith("3.")
+                    ]
                     content = "\n".join(body_lines)
                     if not content:
                         content = "当日无平仓"

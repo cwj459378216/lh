@@ -15,6 +15,8 @@
 !pc/csv/*
 !utils/
 !utils/*
+!csv/
+!csv/*
 
 # 本地敏感信息（不要提交）
 pc/ths_secrets.toml

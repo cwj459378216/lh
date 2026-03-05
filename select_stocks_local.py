@@ -48,6 +48,29 @@ def _update_selection_maintain_form(
         except Exception:
             return ''
 
+    def _load_code_name_map() -> dict[str, str]:
+        """从 csv/stock_code_mapping.csv 读取 symbol->name 映射。"""
+        map_path = os.path.join(os.path.dirname(__file__), 'csv', 'stock_code_mapping.csv')
+        if not os.path.exists(map_path):
+            return {}
+        try:
+            df_map = pd.read_csv(map_path, dtype=str, keep_default_na=False, encoding='utf-8-sig')
+        except Exception:
+            return {}
+        if df_map is None or df_map.empty:
+            return {}
+        col_symbol = 'symbol' if 'symbol' in df_map.columns else None
+        col_name = 'name' if 'name' in df_map.columns else None
+        if not col_symbol or not col_name:
+            return {}
+        out: dict[str, str] = {}
+        for _, r in df_map.iterrows():
+            sym = _norm_str(r.get(col_symbol, '')).upper()
+            name = _norm_str(r.get(col_name, ''))
+            if sym and name and sym not in out:
+                out[sym] = name
+        return out
+
     # 从选股输出中抽取“股票代码/原始评分”
     if '标的' in selected_df_cn.columns:
         codes = selected_df_cn['标的'].map(_norm_str)
@@ -67,10 +90,14 @@ def _update_selection_maintain_form(
     else:
         raw_scores = pd.Series([''] * len(selected_df_cn))
 
+    code_name_map = _load_code_name_map()
+    stock_names = codes.map(lambda x: code_name_map.get(_norm_str(x).upper(), ''))
+
     new_rows = pd.DataFrame(
         {
             '信号日': [signal_date_yyyymmdd] * len(selected_df_cn),
             '股票代码': codes,
+            '股票名': stock_names,
             '原始评分': raw_scores,
             '是否平仓': [''] * len(selected_df_cn),
             '平仓日期': [''] * len(selected_df_cn),
@@ -83,7 +110,7 @@ def _update_selection_maintain_form(
 
     os.makedirs(os.path.dirname(form_path), exist_ok=True)
 
-    required_cols = ['信号日', '股票代码', '原始评分', '是否平仓', '平仓日期', '平仓原因']
+    required_cols = ['信号日', '股票代码', '股票名', '原始评分', '是否平仓', '平仓日期', '平仓原因']
     if os.path.exists(form_path):
         old = pd.read_csv(form_path, dtype=str, keep_default_na=False, encoding='utf-8-sig')
         for c in required_cols:
@@ -113,6 +140,19 @@ def _update_selection_maintain_form(
                     continue
                 if _norm_str(old.at[idx, '原始评分']) == '' and _norm_str(new_rows.at[i, '原始评分']) != '':
                     old.at[idx, '原始评分'] = _norm_str(new_rows.at[i, '原始评分'])
+
+        # 补齐：若历史行“股票名”为空，则用本次对应值补上
+        if '股票名' in old.columns:
+            old_key_to_idx2: dict[str, int] = {}
+            for i, k in enumerate(old_key):
+                if k and k not in old_key_to_idx2:
+                    old_key_to_idx2[k] = i
+            for i, k in enumerate(new_key):
+                idx = old_key_to_idx2.get(k)
+                if idx is None:
+                    continue
+                if _norm_str(old.at[idx, '股票名']) == '' and _norm_str(new_rows.at[i, '股票名']) != '':
+                    old.at[idx, '股票名'] = _norm_str(new_rows.at[i, '股票名'])
 
         out = pd.concat([old, appended], ignore_index=True)
     else:
