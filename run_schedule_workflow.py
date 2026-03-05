@@ -4,7 +4,6 @@
 - 每天定时触发，但仅在【中国法定工作日】才真正执行：
     - python run_daily_workflow.py --flow stoploss
     - python run_daily_workflow.py --flow select
-    - python run_daily_workflow.py --flow pc
 
 说明：
 - 这是一个常驻进程脚本，需要一直运行（可放在后台/用 launchd/pm2/supervisor 等托管）。
@@ -20,7 +19,6 @@
     # 仅调度某一个流程（另一个不跑）
     python run_schedule_workflow.py --flow stoploss
     python run_schedule_workflow.py --flow select
-    python run_schedule_workflow.py --flow pc
 
     # 立即触发一次（然后仍保持常驻）
     python run_schedule_workflow.py --flow stoploss --run-now
@@ -81,9 +79,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--flow",
-        choices=["stoploss", "select", "pc", "all"],
+        choices=["stoploss", "select", "all"],
         default="all",
-        help="调度哪些流程：stoploss / select / pc / all(默认全部调度)",
+        help="调度哪些流程：stoploss / select / all(默认全部调度)",
     )
     parser.add_argument(
         "--run-now",
@@ -95,35 +93,14 @@ def main() -> int:
     flow = str(getattr(args, 'flow', 'all') or 'all').strip().lower()
     skip_snapshot = bool(getattr(args, 'skip_snapshot', False))
 
-    # 07:00 pc（在线策略选股）
-    if flow in ("pc", "all"):
-        schedule.every().day.at("07:00").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    if flow in ("pc", "all"):
-        schedule.every().day.at("09:15").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    if flow in ("pc", "all"):
-        schedule.every().day.at("09:25").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    if flow in ("pc", "all"):
-        schedule.every().day.at("09:35").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    if flow in ("pc", "all"):
-        schedule.every().day.at("09:45").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    if flow in ("pc", "all"):
-        schedule.every().day.at("11:45").do(_run_flow, flow="pc", skip_snapshot=skip_snapshot)
-
-    # 14:50 stoploss
+    # 14:57 stoploss
     if flow in ("stoploss", "all"):
-        schedule.every().day.at("14:50").do(_run_flow, flow="stoploss", skip_snapshot=skip_snapshot)
+        schedule.every().day.at("14:57").do(_run_flow, flow="stoploss", skip_snapshot=skip_snapshot)
     # 15:20 select
     if flow in ("select", "all"):
         schedule.every().day.at("15:20").do(_run_flow, flow="select", skip_snapshot=skip_snapshot)
 
     if bool(getattr(args, 'run_now', False)):
-        if flow in ("pc", "all"):
-            _run_flow(flow="pc", skip_snapshot=skip_snapshot)
         if flow in ("stoploss", "all"):
             _run_flow(flow="stoploss", skip_snapshot=skip_snapshot)
         if flow in ("select", "all"):
