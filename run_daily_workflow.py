@@ -542,14 +542,14 @@ def main() -> int:
                         _print_df(df_form, f"维护表单: {os.path.relpath(selection_form, ROOT)}", max_rows=50)
                         break
                 else:
-                    # 当日平仓：平仓日期 <= end_date 且 是否平仓 == 是
+                    # 当日平仓：平仓日期 == end_date 且 是否平仓 == 是
                     df_closed = df_form.copy()
                     df_closed["是否平仓"] = df_closed["是否平仓"].astype(str).str.strip()
                     df_closed["平仓日期"] = df_closed["平仓日期"].astype(str).str.strip().str.replace("-", "", regex=False)
 
                     df_closed = df_closed[
                         (df_closed["是否平仓"] == "是")
-                        & (df_closed["平仓日期"].astype(str) <= end_date)
+                        & (df_closed["平仓日期"].astype(str) == end_date)
                     ].copy()
 
                     if newly_closed_keys:
